@@ -6,11 +6,16 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// OmaCoin detail popup: primary-coin hero with a 1h/1d/1w trend line, the
-// tracked-coin list (price, volume, 1h/24h/7d change, make-primary and
-// remove actions), CoinGecko search for adding coins, and the check
-// frequency picker. All mutations go through the host BarWidget so they
-// land in the widget's shell.json entry and every bar instance syncs.
+// OmaCoin detail popup, split across two tabs:
+//
+//   COINS    primary-coin hero with a 1h/1d/1w trend line, the tracked-coin
+//            list (price, volume, 1h/24h/7d change, make-primary and remove
+//            actions), and CoinGecko search for adding coins
+//   SETTINGS check-frequency slider (1 minute → 1 day over CoinGecko's
+//            ladder) and the flat-band slider (0–5%, 0.1% steps)
+//
+// All mutations go through the host BarWidget so they land in the widget's
+// shell.json entry and every bar instance syncs.
 Panel {
   id: root
   moduleName: "crueber.omacoin"
@@ -22,9 +27,16 @@ Panel {
   readonly property var barIdentity: hostWidget || root
 
   // ---- popup state
-  property string trendRange: "1d" // "1h" | "1d" | "1w"
-  property var chartPrices: []     // market_chart (5-minutely, last day) for the primary
+  property string activeTab: "coins" // "coins" | "settings"
+  property string trendRange: "1d"   // "1h" | "1d" | "1w"
+  property var chartPrices: []       // market_chart (5-minutely, last day) for the primary
   property var searchResults: []
+
+  // Slider drag previews: -1 means "not dragging, show the committed
+  // value". Committed only on release so shell.json is written once per
+  // adjustment rather than per drag tick.
+  property int freqPreview: -1
+  property real flatPreview: -1
 
   // ---- host state, pulled from the BarWidget
   //
@@ -38,7 +50,9 @@ Panel {
   property var trackedCoins: []
   property string primary: ""
   property int intervalMin: 60
+  property real flatThresholdPct: Model.FLAT_DEFAULT
   property date lastUpdated: new Date(0)
+  property string fetchError: ""
 
   function syncFromHost() {
     if (!hostWidget) return
@@ -47,7 +61,9 @@ Panel {
     trackedCoins = hostWidget.trackedCoins
     primary = hostWidget.primary
     intervalMin = hostWidget.intervalMin
+    flatThresholdPct = hostWidget.flatThresholdPct
     lastUpdated = hostWidget.lastUpdated
+    fetchError = hostWidget.fetchError
   }
 
   onHostWidgetChanged: syncFromHost()
@@ -104,9 +120,13 @@ Panel {
 
   // market_chart days=1 gives 5-minutely points: the raw material for both
   // the 1h window (last 12 points) and the 1d line. One extra call per
-  // primary coin, only while the panel is being used.
+  // primary coin, only while the panel is being used. The fetch is tagged
+  // with the coin it belongs to and mismatched completions are discarded,
+  // so a slow response for the previous primary can never render under
+  // the new primary's name.
   function refreshCharts() {
     if (!primary || chartProc.running) return
+    chartProc.activeId = primary
     chartProc.command = ["curl", "-fsS", "--max-time", "15",
       "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
       + "/market_chart?vs_currency=usd&days=1"]
@@ -124,6 +144,7 @@ Panel {
       "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText)]
     searchProc.running = true
   }
+
   function addCoin(id) {
     if (hostWidget && typeof hostWidget.addCoin === "function") hostWidget.addCoin(id)
     addField.text = ""
@@ -142,16 +163,25 @@ Panel {
     Qt.callLater(syncFromHost)
   }
 
-
   function setInterval(minutes) {
     if (hostWidget && typeof hostWidget.updateSetting === "function")
-      hostWidget.updateSetting("intervalMin", minutes)
+      hostWidget.updateSetting("intervalMin", Model.clampInterval(minutes))
+    Qt.callLater(syncFromHost)
+  }
+
+  function setFlatThreshold(pct) {
+    if (hostWidget && typeof hostWidget.updateSetting === "function")
+      hostWidget.updateSetting("flatThresholdPct", Model.clampFlat(pct))
     Qt.callLater(syncFromHost)
   }
 
   onPrimaryChanged: {
-    // Never show the previous coin's chart under the new primary's name.
+    // Never show the previous coin's chart under the new primary's name:
+    // drop what we have, cancel any in-flight fetch for the old coin, and
+    // pull fresh data for the new one.
     chartPrices = []
+    chartProc.activeId = ""
+    chartProc.running = false
     if (opened) refreshCharts()
   }
 
@@ -159,10 +189,14 @@ Panel {
 
   Process {
     id: chartProc
+    property string activeId: ""
 
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.chartPrices = Model.parseMarketChart(text)
+      onStreamFinished: {
+        if (chartProc.activeId !== root.primary) return // stale coin's fetch
+        root.chartPrices = Model.parseMarketChart(text)
+      }
     }
   }
 
@@ -173,15 +207,19 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        // The query moved on while this fetch was in flight — drop the
+        // stale results and fetch the latest (weather's geocoder pattern).
+        if (root.searchText !== searchProc.activeQuery) {
+          if (root.searchText === "") root.searchResults = []
+          else searchDebounce.restart()
+          return
+        }
         var results = Model.parseSearch(text)
         var filtered = []
         for (var i = 0; i < results.length && filtered.length < 8; i++) {
           if (root.trackedCoins.indexOf(results[i].id) < 0) filtered.push(results[i])
         }
         root.searchResults = filtered
-        // The query moved on while this fetch was in flight — fetch the
-        // latest one right after (weather's geocoder pattern).
-        if (root.searchText !== searchProc.activeQuery) searchDebounce.restart()
       }
     }
   }
@@ -206,11 +244,19 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: addField.activeFocus || freqDropdown.popupOpen
+      blocked: addField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) {
+        // j/k and the arrow keys scroll the panel instead of dying here.
+        if (!scroll.interactive) return
+        var step = Style.space(36)
+        var next = scroll.contentY + (dy > 0 ? step : -step)
+        scroll.contentY = Math.max(0, Math.min(scroll.contentHeight - scroll.height, next))
+      }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
+        else if (t === "s" || t === "S") root.activeTab = root.activeTab === "coins" ? "settings" : "coins"
         else if (t === "t" || t === "T") {
           var order = ["1h", "1d", "1w"]
           root.trendRange = order[(order.indexOf(root.trendRange) + 1) % order.length]
@@ -231,196 +277,284 @@ Panel {
           width: scroll.width
           spacing: Style.space(14)
 
-          // ------------------------------------------------------ hero
-          Item {
+          // ------------------------------------------------------- tabs
+          Row {
             width: parent.width
-            implicitHeight: Math.max(heroLeft.implicitHeight, heroRight.implicitHeight)
+            spacing: Style.space(6)
 
-            Column {
-              id: heroLeft
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-
-              Text {
-                text: root.primaryRow ? root.primaryRow.name : "OmaCoin"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.heading
-                font.bold: true
-                elide: Text.ElideRight
-                width: Math.min(implicitWidth, Style.space(300))
-              }
-
-              Text {
-                text: root.primaryRow
-                  ? (root.primaryRow.symbol + " · USD · VOL " + Model.formatCompactUsd(root.primaryRow.vol24h))
-                  : "CoinGecko · USD"
-                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.letterSpacing: 0.5
-              }
+            Button {
+              text: "COINS"
+              selected: root.activeTab === "coins"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.spacing.md
+              verticalPadding: Style.spacing.xxs
+              onClicked: root.activeTab = "coins"
             }
 
-            Column {
-              id: heroRight
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-
-              Text {
-                anchors.right: parent.right
-                text: root.primaryRow && root.primaryRow.price !== null ? Model.formatUsd(root.primaryRow.price) : "—"
-                color: root.bar ? root.bar.foreground : Color.foreground
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.display
-                font.bold: true
-              }
-
-              Text {
-                anchors.right: parent.right
-                visible: root.primaryRow && root.primaryRow.change24h !== null
-                text: root.primaryRow ? "24h " + Model.formatPct(root.primaryRow.change24h) : ""
-                color: root.primaryRow && root.primaryRow.change24h >= 0 ? root.upColor : root.downColor
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.subtitle
-                font.bold: true
-              }
+            Button {
+              text: "SETTINGS"
+              selected: root.activeTab === "settings"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.spacing.md
+              verticalPadding: Style.spacing.xxs
+              onClicked: root.activeTab = "settings"
             }
           }
 
-          // ------------------------------------------------- trend line
-          Column {
+          Text {
+            visible: root.fetchError !== ""
             width: parent.width
-            spacing: Style.space(8)
+            text: "⚠ " + root.fetchError + " · showing last known prices"
+            color: Color.urgent
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
 
+          // ==================================================== COINS TAB
+          Column {
+            visible: root.activeTab === "coins"
+            width: parent.width
+            spacing: Style.space(14)
+
+            // ------------------------------------------------------ hero
             Item {
               width: parent.width
-              height: Math.max(trendHeaderLabel.implicitHeight, trendButtons.implicitHeight)
+              implicitHeight: Math.max(heroLeft.implicitHeight, heroRight.implicitHeight)
 
-              PanelSectionHeader {
-                id: trendHeaderLabel
-                text: "TREND"
-                foreground: root.bar ? root.bar.foreground : Color.foreground
+              Column {
+                id: heroLeft
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  text: root.primaryRow ? root.primaryRow.name : "OmaCoin"
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.heading
+                  font.bold: true
+                  elide: Text.ElideRight
+                  width: Math.min(implicitWidth, Style.space(300))
+                }
+
+                Text {
+                  text: root.primaryRow
+                    ? (root.primaryRow.symbol + " · USD · VOL " + Model.formatCompactUsd(root.primaryRow.vol24h))
+                    : "CoinGecko · USD"
+                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.caption
+                  font.letterSpacing: 0.5
+                }
               }
 
-              Row {
-                id: trendButtons
+              Column {
+                id: heroRight
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(4)
+                spacing: Style.space(2)
 
-                Repeater {
-                  model: [
-                    { key: "1h", label: "1H" },
-                    { key: "1d", label: "1D" },
-                    { key: "1w", label: "1W" }
-                  ]
+                Text {
+                  anchors.right: parent.right
+                  text: root.primaryRow && root.primaryRow.price !== null ? Model.formatUsd(root.primaryRow.price) : "—"
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.display
+                  font.bold: true
+                }
 
-                  Button {
-                    required property var modelData
-                    text: modelData.label
-                    selected: root.trendRange === modelData.key
-                    foreground: root.bar ? root.bar.foreground : Color.foreground
-                    fontSize: Style.font.bodySmall
-                    horizontalPadding: Style.spacing.sm
-                    verticalPadding: Style.spacing.xxs
-                    onClicked: root.trendRange = modelData.key
-                  }
+                Text {
+                  anchors.right: parent.right
+                  visible: root.primaryRow && root.primaryRow.change24h !== null
+                  text: root.primaryRow ? "24h " + Model.formatPct(root.primaryRow.change24h) : ""
+                  color: root.primaryRow && root.primaryRow.change24h >= 0 ? root.upColor : root.downColor
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.subtitle
+                  font.bold: true
                 }
               }
             }
 
-            Sparkline {
+            // ------------------------------------------------- trend line
+            Column {
               width: parent.width
-              height: Style.space(88)
-              series: root.trendSeries
-              lineColor: root.trendColor
-            }
+              spacing: Style.space(8)
 
-            Text {
-              visible: root.trendSeries.length > 0
-              width: parent.width
-              horizontalAlignment: Text.AlignRight
-              text: {
-                var label = root.trendRange === "1h" ? "past hour" : (root.trendRange === "1d" ? "past day" : "past week")
-                return root.trendChange !== null ? Model.formatPct(root.trendChange) + " (" + label + ")" : label
+              Item {
+                width: parent.width
+                height: Math.max(trendHeaderLabel.implicitHeight, trendButtons.implicitHeight)
+
+                PanelSectionHeader {
+                  id: trendHeaderLabel
+                  text: "TREND"
+                  foreground: root.bar ? root.bar.foreground : Color.foreground
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Row {
+                  id: trendButtons
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Repeater {
+                    model: [
+                      { key: "1h", label: "1H" },
+                      { key: "1d", label: "1D" },
+                      { key: "1w", label: "1W" }
+                    ]
+
+                    Button {
+                      required property var modelData
+                      text: modelData.label
+                      selected: root.trendRange === modelData.key
+                      foreground: root.bar ? root.bar.foreground : Color.foreground
+                      fontSize: Style.font.bodySmall
+                      horizontalPadding: Style.spacing.sm
+                      verticalPadding: Style.spacing.xxs
+                      onClicked: root.trendRange = modelData.key
+                    }
+                  }
+                }
               }
-              color: root.trendColor
-              font.family: root.bar ? root.bar.fontFamily : Style.font.family
-              font.pixelSize: Style.font.bodySmall
+
+              Sparkline {
+                width: parent.width
+                height: Style.space(88)
+                series: root.trendSeries
+                lineColor: root.trendColor
+              }
+
+              Text {
+                visible: root.trendSeries.length > 0
+                width: parent.width
+                horizontalAlignment: Text.AlignRight
+                text: {
+                  var label = root.trendRange === "1h" ? "past hour" : (root.trendRange === "1d" ? "past day" : "past week")
+                  return root.trendChange !== null ? Model.formatPct(root.trendChange) + " (" + label + ")" : label
+                }
+                color: root.trendColor
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                visible: root.trendSeries.length === 0
+                width: parent.width
+                text: root.primaryRow ? "Loading trend…" : "No coin selected."
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+            // ---------------------------------------------- tracked coins
+            PanelSectionHeader {
+              text: "TRACKED · " + root.rows.length
+              foreground: root.bar ? root.bar.foreground : Color.foreground
             }
 
             Text {
-              visible: root.trendSeries.length === 0
+              visible: root.trackedCoins.length === 0
               width: parent.width
-              text: root.primaryRow ? "Loading trend…" : "No coin selected."
+              text: "No coins tracked. Search below to add one."
               color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
             }
-          }
 
-          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+            Text {
+              visible: root.trackedCoins.length > 0 && root.rows.length === 0
+              width: parent.width
+              text: "Waiting for CoinGecko data…"
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
 
-          // ---------------------------------------------- tracked coins
-          PanelSectionHeader {
-            text: "TRACKED · " + root.rows.length
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-          }
+            Repeater {
+              model: root.rows
 
-          Text {
-            visible: root.trackedCoins.length === 0
-            width: parent.width
-            text: "No coins tracked. Search below to add one."
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
+              delegate: Rectangle {
+                id: coinRow
+                required property var modelData
+                width: parent ? parent.width : 0
+                implicitHeight: Style.space(52)
+                radius: Style.cornerRadius
+                color: rowMouse.containsMouse || modelData.id === root.primary
+                  ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                  : "transparent"
 
-          Text {
-            visible: root.trackedCoins.length > 0 && root.rows.length === 0
-            width: parent.width
-            text: "Waiting for CoinGecko data…"
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
+                // Declared BEFORE the RowLayout: later siblings stack
+                // above earlier ones, so the row's click target stays
+                // under the ★ / ✕ action buttons instead of swallowing
+                // them (first-party panels order these the same way).
+                MouseArea {
+                  id: rowMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  acceptedButtons: Qt.LeftButton
+                  onClicked: root.setPrimary(coinRow.modelData.id)
+                }
 
-          Repeater {
-            model: root.rows
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(4)
+                  spacing: Style.space(10)
 
-            delegate: Rectangle {
-              id: coinRow
-              required property var modelData
-              width: parent ? parent.width : 0
-              implicitHeight: Style.space(52)
-              radius: Style.cornerRadius
-              color: rowMouse.containsMouse || modelData.id === root.primary
-                ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-                : "transparent"
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
 
-              RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(4)
-                spacing: Style.space(10)
+                    Row {
+                      spacing: Style.space(6)
 
-                ColumnLayout {
-                  Layout.fillWidth: true
-                  spacing: Style.space(2)
+                      Text {
+                        text: coinRow.modelData.symbol
+                        color: root.bar ? root.bar.foreground : Color.foreground
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                      }
 
-                  Row {
-                    spacing: Style.space(6)
+                      Text {
+                        text: coinRow.modelData.name
+                        color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.pixelSize: Style.font.bodySmall
+                        elide: Text.ElideRight
+                        width: Math.min(implicitWidth, Style.space(150))
+                      }
+                    }
 
                     Text {
-                      text: coinRow.modelData.symbol
+                      text: "1h " + Model.formatPct(coinRow.modelData.change1h)
+                        + "  ·  24h " + Model.formatPct(coinRow.modelData.change24h)
+                        + "  ·  7d " + Model.formatPct(coinRow.modelData.change7d)
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Column {
+                    Layout.alignment: Qt.AlignVCenter
+                    spacing: Style.space(2)
+
+                    Text {
+                      anchors.right: parent.right
+                      text: coinRow.modelData.price !== null ? Model.formatUsd(coinRow.modelData.price) : "—"
                       color: root.bar ? root.bar.foreground : Color.foreground
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.body
@@ -428,203 +562,221 @@ Panel {
                     }
 
                     Text {
-                      text: coinRow.modelData.name
-                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                      anchors.right: parent.right
+                      text: "VOL " + Model.formatCompactUsd(coinRow.modelData.vol24h)
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                      font.pixelSize: Style.font.bodySmall
-                      elide: Text.ElideRight
-                      width: Math.min(implicitWidth, Style.space(150))
+                      font.pixelSize: Style.font.caption
                     }
                   }
 
-                  Text {
-                    text: "1h " + Model.formatPct(coinRow.modelData.change1h)
-                      + "  ·  24h " + Model.formatPct(coinRow.modelData.change24h)
-                      + "  ·  7d " + Model.formatPct(coinRow.modelData.change7d)
-                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                  }
-                }
-
-                Column {
-                  Layout.alignment: Qt.AlignVCenter
-                  spacing: Style.space(2)
-
-                  Text {
-                    anchors.right: parent.right
-                    text: coinRow.modelData.price !== null ? Model.formatUsd(coinRow.modelData.price) : "—"
-                    color: root.bar ? root.bar.foreground : Color.foreground
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.body
-                    font.bold: true
+                  PanelActionButton {
+                    iconText: coinRow.modelData.id === root.primary ? "★" : "☆"
+                    tooltipText: coinRow.modelData.id === root.primary ? "Primary coin" : "Make primary"
+                    foreground: coinRow.modelData.id === root.primary ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                    onClicked: root.setPrimary(coinRow.modelData.id)
                   }
 
-                  Text {
-                    anchors.right: parent.right
-                    text: "VOL " + Model.formatCompactUsd(coinRow.modelData.vol24h)
-                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
+                  PanelActionButton {
+                    iconText: "✕"
+                    tooltipText: "Remove " + coinRow.modelData.name
+                    hoverColor: Color.urgent
+                    onClicked: root.removeCoin(coinRow.modelData.id)
                   }
-                }
-
-                PanelActionButton {
-                  iconText: coinRow.modelData.id === root.primary ? "★" : "☆"
-                  tooltipText: coinRow.modelData.id === root.primary ? "Primary coin" : "Make primary"
-                  foreground: coinRow.modelData.id === root.primary ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
-                  onClicked: root.setPrimary(coinRow.modelData.id)
-                }
-
-                PanelActionButton {
-                  iconText: "✕"
-                  tooltipText: "Remove " + coinRow.modelData.name
-                  hoverColor: Color.urgent
-                  onClicked: root.removeCoin(coinRow.modelData.id)
-                }
-              }
-
-              MouseArea {
-                id: rowMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                acceptedButtons: Qt.LeftButton
-                // Clicks on the action buttons must not double-fire.
-                onClicked: function(mouse) {
-                  if (mouse.x >= coinRow.width - Style.space(96)) return
-                  root.setPrimary(coinRow.modelData.id)
                 }
               }
             }
-          }
 
-          Text {
-            visible: root.rows.length > 0
-            width: parent.width
-            text: "Click a coin to make it the primary shown in the bar."
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.caption
-          }
+            Text {
+              visible: root.rows.length > 0
+              width: parent.width
+              text: "Click a coin to make it the primary shown in the bar."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+            }
 
-          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+            PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
 
-          // ---------------------------------------------------- add coin
-          PanelSectionHeader {
-            text: "ADD COIN"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-          }
+            // ---------------------------------------------------- add coin
+            PanelSectionHeader {
+              text: "ADD COIN"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+            }
 
-          TextField {
-            id: addField
-            width: parent.width
-            placeholderText: "Search CoinGecko (name or symbol)"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            onTextChanged: searchDebounce.restart()
+            TextField {
+              id: addField
+              width: parent.width
+              placeholderText: "Search CoinGecko (name or symbol)"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              onTextChanged: searchDebounce.restart()
 
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) {
-                text = ""
-                root.searchResults = []
-                event.accepted = true
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  text = ""
+                  root.searchResults = []
+                  event.accepted = true
+                }
               }
             }
-          }
 
-          Repeater {
-            model: root.searchResults
+            Repeater {
+              model: root.searchResults
 
-            delegate: Rectangle {
-              id: resultRow
-              required property var modelData
-              width: parent ? parent.width : 0
-              implicitHeight: Style.space(34)
-              radius: Style.cornerRadius
-              color: resultMouse.containsMouse
-                ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-                : "transparent"
+              delegate: Rectangle {
+                id: resultRow
+                required property var modelData
+                width: parent ? parent.width : 0
+                implicitHeight: Style.space(34)
+                radius: Style.cornerRadius
+                color: resultMouse.containsMouse
+                  ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                  : "transparent"
 
-              RowLayout {
-                anchors.fill: parent
-                anchors.leftMargin: Style.space(10)
-                anchors.rightMargin: Style.space(4)
-                spacing: Style.space(10)
-
-                Text {
-                  Layout.fillWidth: true
-                  text: resultRow.modelData.name + " (" + resultRow.modelData.symbol + ")"
-                  color: root.bar ? root.bar.foreground : Color.foreground
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
-                }
-
-                Text {
-                  visible: resultRow.modelData.rank !== null
-                  text: "#" + resultRow.modelData.rank
-                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-
-                PanelActionButton {
-                  iconText: "＋"
-                  tooltipText: "Track " + resultRow.modelData.name
+                // Before the RowLayout, same z-order rule as coin rows.
+                MouseArea {
+                  id: resultMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
                   onClicked: root.addCoin(resultRow.modelData.id)
                 }
-              }
 
-              MouseArea {
-                id: resultMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.addCoin(resultRow.modelData.id)
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(4)
+                  spacing: Style.space(10)
+
+                  Text {
+                    Layout.fillWidth: true
+                    text: resultRow.modelData.name + " (" + resultRow.modelData.symbol + ")"
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    visible: resultRow.modelData.rank !== null
+                    text: "#" + resultRow.modelData.rank
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  PanelActionButton {
+                    iconText: "＋"
+                    tooltipText: "Track " + resultRow.modelData.name
+                    onClicked: root.addCoin(resultRow.modelData.id)
+                  }
+                }
               }
             }
           }
 
-          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
-
-          // --------------------------------------------- check frequency
-          PanelSectionHeader {
-            text: "CHECK FREQUENCY"
-            foreground: root.bar ? root.bar.foreground : Color.foreground
-          }
-
-          Dropdown {
-            id: freqDropdown
+          // ================================================ SETTINGS TAB
+          Column {
+            visible: root.activeTab === "settings"
             width: parent.width
-            label: ""
-            showLabel: false
-            foreground: Color.popups.text
-            background: Color.popups.background
-            value: String(root.intervalMin)
-            options: Model.intervalOptions()
-            onChanged: function(value) { root.setInterval(Number(value)) }
-          }
+            spacing: Style.space(14)
 
-          Text {
-            width: parent.width
-            text: "CoinGecko's public API accepts one call per minute at most, so the ladder " +
-              "runs from 1 minute up to once per day. Each check is a single call for every tracked coin."
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
+            // ------------------------------------------- check frequency
+            PanelSectionHeader {
+              text: "CHECK FREQUENCY"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+            }
 
-          Text {
-            width: parent.width
-            text: "Updated " + Model.formatTime(root.lastUpdated)
-              + " · every " + Model.intervalLabel(root.intervalMin)
-              + " · Data from CoinGecko"
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignRight
+              text: Model.intervalLabel(Model.ladderAt(root.freqPreview >= 0 ? root.freqPreview : Model.intervalIndex(root.intervalMin)))
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+
+            // Slider position is the ladder rung index (12 rungs, one tick
+            // each): minimum 1 minute, maximum 1 day, and the specific
+            // intervals CoinGecko's rate limits make meaningful.
+            PanelSlider {
+              bar: root.bar
+              width: parent.width
+              minimum: 0
+              maximum: Model.ladderCount() - 1
+              step: 1
+              integer: true
+              tickCount: Model.ladderCount()
+              value: Model.intervalIndex(root.intervalMin)
+              onMoved: function(v) { root.freqPreview = Math.round(v) }
+              onReleased: function(v) { root.setInterval(Model.ladderAt(v)) }
+            }
+
+            Text {
+              width: parent.width
+              text: "CoinGecko's public API accepts one call per minute at most, so the ladder " +
+                "runs from 1 minute up to once per day. Each check is a single call for every tracked coin."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+            // ------------------------------------------------ flat band
+            PanelSectionHeader {
+              text: "FLAT BAND"
+              foreground: root.bar ? root.bar.foreground : Color.foreground
+            }
+
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignRight
+              text: Model.flatLabel(root.flatPreview >= 0 ? root.flatPreview : root.flatThresholdPct)
+              color: root.bar ? root.bar.foreground : Color.foreground
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.subtitle
+              font.bold: true
+            }
+
+            // 0% disables the flat band (every move tints); 5% is the
+            // ceiling. Steps of 0.1%.
+            PanelSlider {
+              bar: root.bar
+              width: parent.width
+              minimum: 0
+              maximum: 5
+              step: 0.1
+              value: root.flatThresholdPct
+              onMoved: function(v) { root.flatPreview = Math.round(v * 10) / 10 }
+              onReleased: function(v) { root.setFlatThreshold(Math.round(v * 10) / 10) }
+            }
+
+            Text {
+              width: parent.width
+              text: "24h moves smaller than this count as flat: the bar shows the price in plain " +
+                "white with a · glyph instead of a green/red tint. Default ±0.5%."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+            Text {
+              width: parent.width
+              text: "Updated " + Model.formatTime(root.lastUpdated)
+                + " · every " + Model.intervalLabel(root.intervalMin)
+                + " · Data from CoinGecko"
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
           }
         }
       }

@@ -1,8 +1,8 @@
 .pragma library
 
 // Pure helpers for OmaCoin: settings normalization, CoinGecko response
-// parsing, and formatting. No Qt imports — everything here is plain JS so
-// it can be shared by the bar widget and the panel.
+// parsing, formatting, and cross-instance poll coordination. No Qt imports
+// — everything here is plain JS shared by the bar widget and the panel.
 
 // ---------------------------------------------------------------- settings
 
@@ -12,13 +12,9 @@
 // that minimum up to once per day; the default is once per hour.
 var INTERVAL_LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 240, 360, 720, 1440]
 
-function intervalOptions() {
-  var options = []
-  for (var i = 0; i < INTERVAL_LADDER.length; i++) {
-    options.push({ value: String(INTERVAL_LADDER[i]), label: intervalLabel(INTERVAL_LADDER[i]) })
-  }
-  return options
-}
+// 24h moves smaller than the flat threshold (percent) count as "no
+// direction": plain foreground, "·" glyph. Default ±0.5%.
+var FLAT_DEFAULT = 0.5
 
 function intervalLabel(minutes) {
   var m = Number(minutes)
@@ -40,6 +36,37 @@ function clampInterval(value) {
     if (Math.abs(INTERVAL_LADDER[i] - n) < Math.abs(best - n)) best = INTERVAL_LADDER[i]
   }
   return best
+}
+
+// Ladder rung index for a (snapped) interval — the frequency slider's
+// position. Falls back to the 60-minute rung if unmatched.
+function intervalIndex(minutes) {
+  var target = clampInterval(minutes)
+  for (var i = 0; i < INTERVAL_LADDER.length; i++) {
+    if (INTERVAL_LADDER[i] === target) return i
+  }
+  return 5
+}
+
+function ladderAt(i) {
+  var idx = Math.max(0, Math.min(INTERVAL_LADDER.length - 1, Math.round(Number(i) || 0)))
+  return INTERVAL_LADDER[idx]
+}
+
+// Clamp the flat threshold onto the slider's range, snapped to 0.1%.
+function clampFlat(value) {
+  var n = Number(value)
+  if (!isFinite(n)) return FLAT_DEFAULT
+  return Math.max(0, Math.min(5, Math.round(n * 10) / 10))
+}
+
+function ladderCount() {
+  return INTERVAL_LADDER.length
+}
+
+function flatLabel(pct) {
+  var n = clampFlat(pct)
+  return n === 0 ? "0% — no flat band" : "±" + n.toFixed(1) + "%"
 }
 
 // Normalize a coins setting (array, or comma-separated string from a
@@ -76,6 +103,9 @@ function parseJson(raw) {
 }
 
 function num(value) {
+  // Missing fields must stay missing: Number(null) === 0 would render
+  // absent change data as "+0.00%" with a green tint.
+  if (value === null || value === undefined || value === "") return null
   var n = Number(value)
   return isFinite(n) ? n : null
 }
@@ -157,7 +187,8 @@ function parseMarketChart(raw) {
 }
 
 // Slice a [[ts, price]] series down to its last `minutes` (5-minutely data
-// from days=1, so an hour is ~12 points).
+// from days=1, so an hour is ~12 points). Returns [] when the window has
+// too few points — substituting the full day would mislabel the trend.
 function windowPoints(series, minutes) {
   if (!Array.isArray(series) || series.length === 0) return []
   var last = series[series.length - 1][0]
@@ -166,7 +197,7 @@ function windowPoints(series, minutes) {
   for (var i = 0; i < series.length; i++) {
     if (series[i][0] >= cutoff) out.push(series[i][1])
   }
-  return out.length >= 2 ? out : series.map(function(p) { return p[1] })
+  return out.length >= 2 ? out : []
 }
 
 function seriesChange(prices) {
@@ -213,9 +244,11 @@ function formatCompactUsd(value) {
   if (!isFinite(n) || n <= 0) return "—"
   if (n >= 1e12) return "$" + (n / 1e12).toFixed(1) + "T"
   if (n >= 1e9) return "$" + (n / 1e9).toFixed(1) + "B"
+  if (n >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M"
   if (n >= 1e3) return "$" + (n / 1e3).toFixed(1) + "K"
   return "$" + Math.round(n)
 }
+
 function formatPct(value) {
   if (value === null || value === undefined) return "—"
   var n = Number(value)
@@ -253,4 +286,46 @@ function sparkPoints(series, w, h, pad) {
     points.push({ x: x, y: y })
   }
   return points
+}
+
+// ------------------------------------------------- poll coordination (M2)
+//
+// A .pragma library is loaded once per QML engine, so this state is shared
+// by every OmaCoin widget instance in the shell process — and a bar
+// surface exists per monitor. Exactly one instance (the "leader") runs the
+// poll loop and publishes results; the others consume them, keeping the
+// one-CoinGecko-call-per-check contract no matter how many monitors show
+// the widget. Leadership is heartbeat-based so a destroyed leader is
+// re-elected within one heartbeat window.
+var pollState = { leader: null, beat: 0, rows: [], updated: 0, error: "" }
+
+function pollClaim(widget, nowMs) {
+  if (pollState.leader === widget) { pollState.beat = nowMs; return true }
+  if (pollState.leader === null || nowMs - pollState.beat > 20000) {
+    pollState.leader = widget
+    pollState.beat = nowMs
+    return true
+  }
+  return false
+}
+
+function pollRelease(widget) {
+  if (pollState.leader === widget) pollState.leader = null
+}
+
+function pollPublish(widget, rows, updatedMs, error) {
+  if (pollState.leader !== widget) return
+  pollState.rows = rows
+  pollState.updated = updatedMs
+  pollState.error = error
+  pollState.beat = Date.now()
+}
+
+function pollConsume(widget) {
+  if (pollState.leader === widget) return null
+  return { rows: pollState.rows, updated: pollState.updated, error: pollState.error }
+}
+
+function pollLeaderInstance() {
+  return pollState.leader
 }

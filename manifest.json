@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "crueber.omacoin",
   "name": "OmaCoin",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "crueber",
   "license": "MIT",
   "description": "CoinGecko crypto tracker: primary coin price in the bar, popup with tracked coins, USD price, volume, and 1h/1d/1w trend lines.",
@@ -21,7 +21,8 @@
     "defaults": {
       "coins": ["bitcoin", "ethereum"],
       "primary": "bitcoin",
-      "intervalMin": 60
+      "intervalMin": 60,
+      "flatThresholdPct": 0.5
     },
     "schema": [
       {
@@ -34,11 +35,21 @@
         "key": "intervalMin",
         "type": "integer",
         "label": "Check frequency (minutes)",
-        "description": "How often to poll CoinGecko. The public API accepts one call per minute at most; the ladder runs from 1 minute up to once per day. Default: 60 (once per hour).",
+        "description": "How often to poll CoinGecko, snapped to the ladder the popup's slider walks: 1, 2, 5, 10, 15, 30, 60, 120, 240, 360, 720 minutes, or 1 day. The public API accepts one call per minute at most. Default: 60 (once per hour).",
         "min": 1,
         "max": 1440,
         "step": 1,
         "defaultValue": 60
+      },
+      {
+        "key": "flatThresholdPct",
+        "type": "number",
+        "label": "Flat band (percent)",
+        "description": "24h moves smaller than this count as flat: the bar shows the price in plain white with a · glyph instead of a green/red tint. 0 disables the band. Default: 0.5.",
+        "min": 0,
+        "max": 5,
+        "step": 0.1,
+        "defaultValue": 0.5
       }
     ]
   }
