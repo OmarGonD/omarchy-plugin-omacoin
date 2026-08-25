@@ -76,6 +76,25 @@ Panel {
     onTriggered: root.syncFromHost()
   }
 
+  // Wall clock for the refresh cooldown. Ticks only while the panel is
+  // open; cooldownRemaining re-evaluates against it every second.
+  property date nowTick: new Date()
+  Timer {
+    interval: 1000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.nowTick = new Date()
+  }
+
+  // Seconds left in the post-refresh lockout. CoinGecko's public API
+  // tolerates roughly one call per minute, so the manual refresh icon
+  // shows soft red (and ignores clicks) for 60s after each successful
+  // check. Zero when the last check is older, or never happened.
+  readonly property real cooldownRemaining: lastUpdated.getTime() > 0
+    ? Math.max(0, 60 - (nowTick.getTime() - lastUpdated.getTime()) / 1000)
+    : 0
+
   // ---- trend state
   readonly property var trendSeries: {
     if (trendRange === "1h") return Model.windowPoints(chartPrices, 60)
@@ -278,28 +297,55 @@ Panel {
           spacing: Style.space(14)
 
           // ------------------------------------------------------- tabs
-          Row {
+          //
+          // Header row: tab switcher on the left, manual refresh on the
+          // right. The refresh icon is soft red for a minute after the
+          // last successful CoinGecko check — the public API tolerates
+          // ~1 call/minute, so a click inside that window is a no-op.
+          Item {
             width: parent.width
-            spacing: Style.space(6)
+            implicitHeight: Math.max(tabRow.implicitHeight, refreshButton.implicitHeight)
 
-            Button {
-              text: "COINS"
-              selected: root.activeTab === "coins"
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              fontSize: Style.font.bodySmall
-              horizontalPadding: Style.spacing.md
-              verticalPadding: Style.spacing.xxs
-              onClicked: root.activeTab = "coins"
+            Row {
+              id: tabRow
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(6)
+
+              Button {
+                text: "COINS"
+                selected: root.activeTab === "coins"
+                foreground: root.bar ? root.bar.foreground : Color.foreground
+                fontSize: Style.font.bodySmall
+                horizontalPadding: Style.spacing.md
+                verticalPadding: Style.spacing.xxs
+                onClicked: root.activeTab = "coins"
+              }
+
+              Button {
+                text: "SETTINGS"
+                selected: root.activeTab === "settings"
+                foreground: root.bar ? root.bar.foreground : Color.foreground
+                fontSize: Style.font.bodySmall
+                horizontalPadding: Style.spacing.md
+                verticalPadding: Style.spacing.xxs
+                onClicked: root.activeTab = "settings"
+              }
             }
 
-            Button {
-              text: "SETTINGS"
-              selected: root.activeTab === "settings"
-              foreground: root.bar ? root.bar.foreground : Color.foreground
-              fontSize: Style.font.bodySmall
-              horizontalPadding: Style.spacing.md
-              verticalPadding: Style.spacing.xxs
-              onClicked: root.activeTab = "settings"
+            PanelActionButton {
+              id: refreshButton
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰑐"
+              foreground: root.cooldownRemaining > 0
+                ? Color.urgent
+                : (root.bar ? root.bar.foreground : Color.foreground)
+              hoverColor: Color.urgent
+              tooltipText: root.cooldownRemaining > 0
+                ? "CoinGecko rate limit — wait " + Math.ceil(root.cooldownRemaining) + "s"
+                : "Refresh from CoinGecko now"
+              onClicked: if (root.cooldownRemaining <= 0) root.refresh()
             }
           }
 

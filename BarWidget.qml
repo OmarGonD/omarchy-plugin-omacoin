@@ -25,6 +25,7 @@ BarWidget {
   // Normalized /coins/markets rows, ordered along the tracked-coin list.
   // Kept on failure so stale prices stay visible while a retry runs.
   property var marketRows: []
+
   property date lastUpdated: new Date(0)
 
   // Fetch health. Empty string when the last check succeeded.
