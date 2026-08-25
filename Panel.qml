@@ -30,6 +30,7 @@ Panel {
   property string activeTab: "coins" // "coins" | "settings"
   property string trendRange: "1d"   // "1h" | "1d" | "1w"
   property var chartPrices: []       // market_chart (5-minutely, last day) for the primary
+  property string chartError: ""     // why the trend chart is unavailable, when it is
   property var searchResults: []
 
   // Slider drag previews: -1 means "not dragging, show the committed
@@ -90,10 +91,9 @@ Panel {
   // Seconds left in the post-refresh lockout, read from the same shared
   // gate every fetch path funnels through (Model.pollState), so the
   // button's color can never disagree with what the fetch choke point
-  // will actually allow. Zero when no check has ever succeeded.
-  readonly property real cooldownRemaining: lastUpdated.getTime() > 0
-    ? Model.pollCooldownRemaining(nowTick.getTime())
-    : 0
+  // will actually allow (and a follower's consume lag cannot show a
+  // clickable button whose click gets dropped).
+  readonly property real cooldownRemaining: Model.pollCooldownRemaining(nowTick.getTime())
 
   // ---- trend state
   readonly property var trendSeries: {
@@ -145,7 +145,10 @@ Panel {
   // the new primary's name.
   function refreshCharts() {
     if (!primary || chartProc.running) return
+    root.chartGen++
+    chartProc.gen = root.chartGen
     chartProc.activeId = primary
+    chartError = ""
     chartProc.command = ["curl", "-fsS", "--max-time", "15",
       "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
       + "/market_chart?vs_currency=usd&days=1"]
@@ -200,6 +203,12 @@ Panel {
     Qt.callLater(syncFromHost)
   }
 
+  // Chart-fetch generation: incremented on every refreshCharts(), so a
+  // killed fetch whose StdioCollector flush lands AFTER a new primary's
+  // fetch was tagged (and the id reused) still fails the generation test
+  // and cannot paint the old coin's series under the new primary's name.
+  property int chartGen: 0
+
   onPrimaryChanged: {
     // Never show the previous coin's chart under the new primary's name:
     // drop what we have, cancel any in-flight fetch for the old coin, and
@@ -208,20 +217,61 @@ Panel {
     // immediate refreshCharts() could see the stale flag and silently
     // skip the new primary's fetch.
     chartPrices = []
-    chartProc.activeId = ""
+    chartError = ""
     chartProc.running = false
     if (opened) Qt.callLater(refreshCharts)
   }
+
   Process {
     id: chartProc
     property string activeId: ""
+    property int gen: 0
+    property string stdoutText: ""
+    property int lastExitCode: 0
+    property bool exitSeen: false
+    property bool streamSeen: false
+
+    function maybeFinish() {
+      if (!exitSeen || !streamSeen) return
+      exitSeen = false
+      streamSeen = false
+      if (gen !== root.chartGen || activeId !== root.primary) {
+        stdoutText = ""
+        return
+      }
+      var points = lastExitCode === 0 ? Model.parseMarketChart(stdoutText) : []
+      if (points.length > 0) {
+        root.chartPrices = points
+        root.chartError = ""
+      } else {
+        root.chartError = lastExitCode === 0
+          ? "No chart data for " + root.primary
+          : Model.describeFetchFailure(lastExitCode, stderrText)
+      }
+      stdoutText = ""
+      stderrText = ""
+    }
+
+    property string stderrText: ""
+
+    onExited: function(exitCode) {
+      lastExitCode = exitCode
+      exitSeen = true
+      maybeFinish()
+    }
 
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        if (chartProc.activeId !== root.primary) return // stale coin's fetch
-        root.chartPrices = Model.parseMarketChart(text)
+        chartProc.stdoutText = text
+        chartProc.streamSeen = true
+        chartProc.maybeFinish()
       }
+    }
+
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: chartProc.stderrText = text
     }
   }
 
@@ -497,7 +547,9 @@ Panel {
               Text {
                 visible: root.trendSeries.length === 0
                 width: parent.width
-                text: root.primaryRow ? "Loading trend…" : "No coin selected."
+                text: !root.primaryRow ? "No coin selected."
+                  : (root.chartError !== "" ? "Trend unavailable — " + root.chartError
+                  : "Loading trend…")
                 color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.bodySmall

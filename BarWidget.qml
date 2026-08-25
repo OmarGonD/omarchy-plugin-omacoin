@@ -76,6 +76,9 @@ BarWidget {
     startupDone = true
   }
   Component.onDestruction: Model.pollRelease(root)
+  // Shortening the interval applies now, not after the old period
+  // finishes (the gate keeps an early restart from double-fetching).
+  onIntervalMinChanged: if (root.pollLeader) poll.restart()
 
   // What the bar paints: symbol, price, and a direction glyph. Moves within
   // the flat band (|24h| < flatThresholdPct, default ±0.5%) count as no
@@ -263,13 +266,25 @@ BarWidget {
     onTriggered: root.marketsFetch()
   }
 
+  // A fetch that arrived inside the rate-limit window is deferred, not
+  // dropped: the caller wanted fresh data for a reason (coin list
+  // changed, leader handover, manual refresh). One armed catch-up per
+  // instance, deduped by Timer.restart() semantics.
+  Timer {
+    id: gateCatchup
+    onTriggered: root.marketsFetch()
+  }
+
   // Every path that wants fresh data lands here (poll tick, manual
   // refresh from the panel / right click / "r", IPC, retry) so the
   // rate-limit cooldown is enforced once, at the choke point, instead of
-  // per caller. Stale-but-usable data is always preferable to a 429.
+  // per caller. Stale-but-usable data is always preferable to a 429 —
+  // but a blocked request is deferred past the gate rather than
+  // discarded, so a coin-list change never waits a full interval.
   function marketsFetch() {
     if (!Model.pollGateOpen(Date.now())) {
-      if (root.initialFetch) root.initialFetch = false
+      gateCatchup.interval = Math.max(1000, Model.pollCooldownRemaining(Date.now()) * 1000 + 500)
+      gateCatchup.restart()
       return
     }
     if (marketsProc.running) {
@@ -281,7 +296,10 @@ BarWidget {
       return
     }
     var ids = root.trackedCoins.join(",")
-    if (ids === "") return
+    if (ids === "") {
+      root.fetchQueued = false
+      return
+    }
     marketsProc.command = ["curl", "-fsS", "--max-time", "15",
       "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
       + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d"]
@@ -307,17 +325,26 @@ BarWidget {
       streamSeen = false
       var ok = lastExitCode === 0
       var map = ok ? Model.parseMarkets(stdoutText) : null
+      // A 200 with an empty array (all tracked ids unknown — typo'd
+      // hand-edited shell.json, delisted coins) is NOT a success: the
+      // bar would otherwise hide with no error to show for it.
+      if (map && Object.keys(map).length === 0) map = null
       if (map) {
         root.fetchRetries = 0
         root.fetchError = ""
         root.marketRows = Model.orderRows(map, root.trackedCoins)
         root.lastUpdated = new Date()
+      } else if (lastExitCode === 0 && stdoutText.replace(/\s+/g, "") !== "") {
+        root.fetchError = "CoinGecko returned no matching coins"
       } else {
         root.fetchError = Model.describeFetchFailure(lastExitCode, stderrText)
       }
       root.initialFetch = false
       Model.pollPublish(root, root.marketRows, root.lastUpdated.getTime(), root.fetchError, !!map)
-      if (!map && root.trackedCoins.length > 0 && root.fetchRetries < 4) {
+      // No-matching-coins is a configuration problem, not a network one —
+      // retrying it just burns the rate limit.
+      var configProblem = root.fetchError === "CoinGecko returned no matching coins"
+      if (!map && !configProblem && root.trackedCoins.length > 0 && root.fetchRetries < 4) {
         root.fetchRetries++
         retryTimer.interval = Model.retryBackoffMs(root.fetchRetries)
         retryTimer.restart()
