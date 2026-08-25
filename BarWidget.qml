@@ -32,6 +32,10 @@ BarWidget {
   property string fetchError: ""
   property int fetchRetries: 0
   property bool fetchQueued: false
+  // True from first launch until the first check finishes (success or
+  // failure): the bar shows its "—" placeholder during the fetch so the
+  // slot does not pop in with a layout shift 15s later.
+  property bool initialFetch: true
 
   // Settings-derived state. QML's dependency tracking does not reliably
   // follow `settings` reads made inside the base class's setting() helper
@@ -63,7 +67,14 @@ BarWidget {
     if (flat !== flatThresholdPct) flatThresholdPct = flat
   }
   onSettingsChanged: applySettings()
-  Component.onCompleted: applySettings()
+  // Suppress the tracked-coins refetch during startup: the poll timer's
+  // triggeredOnStart already fetches, so a changed list would only queue
+  // a redundant second call.
+  property bool startupDone: false
+  Component.onCompleted: {
+    applySettings()
+    startupDone = true
+  }
   Component.onDestruction: Model.pollRelease(root)
 
   // What the bar paints: symbol, price, and a direction glyph. Moves within
@@ -113,20 +124,36 @@ BarWidget {
   }
 
   // ---- shape contract for shell.summon/hide/toggle routing
+  //
+  // The panel Loader is lazy (heavy per-monitor tree): latched on the
+  // first open request and never unloaded afterwards, so `opened` stays
+  // a plain read off the loader item with no feedback into `active`
+  // (which would be a binding loop). pendingOpen carries an open that
+  // arrived before the load finished.
+  property bool panelRequested: false
+  property bool pendingOpen: false
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
 
   function open() {
-    if (panelLoader.item && panelLoader.item.open) panelLoader.item.open()
+    if (panelLoader.item && panelLoader.item.open) {
+      panelLoader.item.open()
+    } else if (!panelLoader.item) {
+      pendingOpen = true
+      panelRequested = true
+    }
   }
 
   function close() {
-    if (panelLoader.item && panelLoader.item.close) panelLoader.item.close()
+    if (panelLoader.item) panelLoader.item.close()
   }
 
   function togglePanel() {
     if (panelLoader.item && panelLoader.item.toggle) panelLoader.item.toggle()
+    else if (!panelLoader.item) {
+      pendingOpen = true
+      panelRequested = true
+    }
   }
-
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
 
   function closeForPopoutSwitch() {
@@ -152,12 +179,12 @@ BarWidget {
     root.updateSettings(changes)
   }
 
-  // Track a new coin. Starts from trackedCoins (normalized, so manifest
-  // defaults survive when shell.json has no coins key yet).
+  // Track a new coin. Normalized through coinList (lowercase, deduped) so
+  // junk or mixed-case ids from IPC can never persist to shell.json and
+  // defeat the dedupe ("Bitcoin" vs "bitcoin" would look distinct).
   function addCoin(id) {
-    var next = root.trackedCoins.slice()
-    if (next.indexOf(id) >= 0) return
-    next.push(id)
+    var next = Model.coinList(root.trackedCoins.concat([id]))
+    if (next.length === root.trackedCoins.length) return
     root.updateSetting("coins", next)
   }
 
@@ -179,21 +206,24 @@ BarWidget {
     if (next) root.updateSetting("primary", next)
   }
 
-  onTrackedCoinsChanged: Qt.callLater(refresh)
+  onTrackedCoinsChanged: if (startupDone) Qt.callLater(refresh)
 
-  // Stay clickable even with no data yet (error state, or every coin
-  // removed) so the panel — the only way back to a working state — stays
-  // reachable by mouse.
-  visible: hasData || fetchError !== "" || trackedCoins.length === 0
+  // Stay clickable even with no data yet (initial fetch in flight, error
+  // state, or every coin removed) so the panel — the only way back to a
+  // working state — stays reachable by mouse.
+  visible: hasData || initialFetch || fetchError !== "" || trackedCoins.length === 0
   implicitWidth: contentRow.implicitWidth + Style.space(16)
   implicitHeight: barSize
 
   // ---- poll coordination ---------------------------------------------
   //
   // Leadership heartbeat + result fan-out. The leader claims once and then
-  // only re-beats; everyone else pulls published rows whenever they are
-  // newer than their own. A dead leader (widget destroyed with the monitor
+  // only re-beats; everyone else consumes published state whenever the
+  // publish sequence moved (successes AND failures — a failed check keeps
+  // the old timestamp, so comparing timestamps would hide errors from
+  // secondary monitors). A dead leader (widget destroyed with the monitor
   // it lived on) stops beating and is replaced within the 20s window.
+  property int consumedSeq: 0
   Timer {
     id: pollCoordination
     interval: 5000
@@ -205,10 +235,12 @@ BarWidget {
       root.pollLeader = Model.pollClaim(root, Date.now())
       if (root.pollLeader || wasLeader) return
       var shared = Model.pollConsume(root)
-      if (shared && shared.updated > root.lastUpdated.getTime()) {
+      if (shared && shared.seq > root.consumedSeq) {
+        root.consumedSeq = shared.seq
         root.marketRows = shared.rows
         root.lastUpdated = new Date(shared.updated)
         root.fetchError = shared.error
+        root.initialFetch = false
       }
     }
   }
@@ -223,15 +255,23 @@ BarWidget {
   }
 
   // Bounded retry after a failed check (network down, rate limited,
-  // CoinGecko error). Retries give up after four attempts and surface the
-  // failure in the panel instead of retrying forever.
+  // CoinGecko error) with escalating backoff. Retries give up after four
+  // attempts and surface the failure in the panel until the next
+  // scheduled check.
   Timer {
     id: retryTimer
-    interval: 15000
     onTriggered: root.marketsFetch()
   }
 
+  // Every path that wants fresh data lands here (poll tick, manual
+  // refresh from the panel / right click / "r", IPC, retry) so the
+  // rate-limit cooldown is enforced once, at the choke point, instead of
+  // per caller. Stale-but-usable data is always preferable to a 429.
   function marketsFetch() {
+    if (!Model.pollGateOpen(Date.now())) {
+      if (root.initialFetch) root.initialFetch = false
+      return
+    }
     if (marketsProc.running) {
       // A fetch is already in flight (e.g. refresh raced the poll tick).
       // Queue one re-run with the latest command rather than restarting
@@ -248,46 +288,85 @@ BarWidget {
     marketsProc.running = true
   }
 
-  function handleFetchFailure() {
-    root.fetchRetries++
-    root.fetchError = "CoinGecko check failed" + (root.fetchRetries > 1 ? " · retry " + (root.fetchRetries - 1) + "/4" : "")
-    Model.pollPublish(root, root.marketRows, root.lastUpdated.getTime(), root.fetchError)
-    if (root.fetchRetries <= 4) retryTimer.restart()
-  }
-
-  // One call per check regardless of how many coins are tracked.
+  // One call per check regardless of how many coins are tracked. The
+  // exit code and stderr are captured so a failure says WHY it failed
+  // (DNS vs rate limit vs timeout) instead of a generic "check failed".
+  // stdout, stderr and the exit signal can arrive in any order, so the
+  // result is processed once both the stream and the exit are in.
   Process {
     id: marketsProc
+    property string stdoutText: ""
+    property string stderrText: ""
+    property int lastExitCode: 0
+    property bool exitSeen: false
+    property bool streamSeen: false
+
+    function maybeFinish() {
+      if (!exitSeen || !streamSeen) return
+      exitSeen = false
+      streamSeen = false
+      var ok = lastExitCode === 0
+      var map = ok ? Model.parseMarkets(stdoutText) : null
+      if (map) {
+        root.fetchRetries = 0
+        root.fetchError = ""
+        root.marketRows = Model.orderRows(map, root.trackedCoins)
+        root.lastUpdated = new Date()
+      } else {
+        root.fetchError = Model.describeFetchFailure(lastExitCode, stderrText)
+      }
+      root.initialFetch = false
+      Model.pollPublish(root, root.marketRows, root.lastUpdated.getTime(), root.fetchError, !!map)
+      if (!map && root.trackedCoins.length > 0 && root.fetchRetries < 4) {
+        root.fetchRetries++
+        retryTimer.interval = Model.retryBackoffMs(root.fetchRetries)
+        retryTimer.restart()
+      }
+      stdoutText = ""
+      stderrText = ""
+      if (root.fetchQueued) {
+        root.fetchQueued = false
+        Qt.callLater(root.marketsFetch)
+      }
+    }
+
+    onExited: function(exitCode) {
+      lastExitCode = exitCode
+      exitSeen = true
+      maybeFinish()
+    }
 
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var map = Model.parseMarkets(text)
-        if (map) {
-          root.fetchRetries = 0
-          root.fetchError = ""
-          root.marketRows = Model.orderRows(map, root.trackedCoins)
-          root.lastUpdated = new Date()
-          Model.pollPublish(root, root.marketRows, root.lastUpdated.getTime(), "")
-        } else if (root.trackedCoins.length > 0) {
-          root.handleFetchFailure()
-        }
-        if (root.fetchQueued) {
-          root.fetchQueued = false
-          Qt.callLater(root.marketsFetch)
-        }
+        marketsProc.stdoutText = text
+        marketsProc.streamSeen = true
+        marketsProc.maybeFinish()
       }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: marketsProc.stderrText = text
     }
   }
 
+  // The panel tree (Canvas, search process, key catcher) is heavy and a
+  // bar surface exists per monitor — instantiated only on first open and
+  // kept afterwards (open() must stay synchronous for summon routing).
   Loader {
     id: panelLoader
-    active: true
+    // panelRequested never resets once set: load-once, keep-forever.
+    // open() sets it when the item is missing; onLoaded forwards the
+    // pending open into the freshly built panel.
+    active: root.panelRequested
     source: Qt.resolvedUrl("Panel.qml")
     visible: false
     onLoaded: {
       root.injectPanel()
       Qt.callLater(root.injectPanel)
+      if (root.pendingOpen && panelLoader.item && panelLoader.item.open)
+        Qt.callLater(function() { panelLoader.item.open() })
+      root.pendingOpen = false
     }
   }
 

@@ -127,8 +127,7 @@ function parseMarkets(raw) {
       vol24h: num(r.total_volume),
       high24h: num(r.high_24h),
       low24h: num(r.low_24h),
-      change1h: num(r.price_change_percentage_1h_in_currency),
-      change24h: num(r.price_change_percentage_24h_in_currency !== undefined
+      change24h: num(num(r.price_change_percentage_24h_in_currency) !== null
         ? r.price_change_percentage_24h_in_currency : r.price_change_percentage_24h),
       change7d: num(r.price_change_percentage_7d_in_currency),
       spark7d: (r.sparkline_in_7d && Array.isArray(r.sparkline_in_7d.price)) ? r.sparkline_in_7d.price : []
@@ -288,16 +287,41 @@ function sparkPoints(series, w, h, pad) {
   return points
 }
 
-// ------------------------------------------------- poll coordination (M2)
+// ------------------------------------------------- poll coordination
 //
-// A .pragma library is loaded once per QML engine, so this state is shared
-// by every OmaCoin widget instance in the shell process — and a bar
-// surface exists per monitor. Exactly one instance (the "leader") runs the
-// poll loop and publishes results; the others consume them, keeping the
-// one-CoinGecko-call-per-check contract no matter how many monitors show
-// the widget. Leadership is heartbeat-based so a destroyed leader is
-// re-elected within one heartbeat window.
-var pollState = { leader: null, beat: 0, rows: [], updated: 0, error: "" }
+// A .pragma library is loaded once per QML engine and this state is shared
+// by every OmaCoin widget instance in the shell process. The host runs
+// one engine for the whole shell: shell.qml creates every plugin component
+// with Qt.createComponent, and the per-monitor bar surfaces are Variants
+// expansions inside plugins/bar/Bar.qml — same document, same engine (its
+// moduleWidgets() hands live per-monitor widget objects to plain JS, which
+// only works within one engine). So exactly one instance (the "leader")
+// runs the poll loop and publishes results; the others consume them,
+// keeping the one-CoinGecko-call-per-check contract no matter how many
+// monitors show the widget. Leadership is heartbeat-based so a destroyed
+// leader is re-elected within one heartbeat window.
+//
+// `seq` increments on EVERY publish (success or failure) — followers
+// consume on seq change, not on timestamp, because a failed check
+// republishes with the unchanged last-success timestamp and an error
+// message the followers must still see.
+var pollState = { leader: null, beat: 0, seq: 0, rows: [], updated: 0, error: "", lastSuccessMs: 0 }
+
+// The public API tolerates roughly one call per minute, so every fetch
+// path (poll tick, manual refresh, retry) funnels through this gate
+// rather than trusting each caller to check a cooldown itself.
+var POLL_COOLDOWN_MS = 60000
+
+function pollGateOpen(nowMs) {
+  return nowMs - pollState.lastSuccessMs >= POLL_COOLDOWN_MS
+}
+
+// Seconds left in the lockout — the panel's refresh button paints this
+// as its countdown. Zero when no check has ever succeeded.
+function pollCooldownRemaining(nowMs) {
+  if (pollState.lastSuccessMs === 0) return 0
+  return Math.max(0, (POLL_COOLDOWN_MS - (nowMs - pollState.lastSuccessMs)) / 1000)
+}
 
 function pollClaim(widget, nowMs) {
   if (pollState.leader === widget) { pollState.beat = nowMs; return true }
@@ -313,19 +337,52 @@ function pollRelease(widget) {
   if (pollState.leader === widget) pollState.leader = null
 }
 
-function pollPublish(widget, rows, updatedMs, error) {
+function pollPublish(widget, rows, updatedMs, error, ok) {
   if (pollState.leader !== widget) return
   pollState.rows = rows
   pollState.updated = updatedMs
   pollState.error = error
   pollState.beat = Date.now()
+  pollState.seq++
+  if (ok) pollState.lastSuccessMs = updatedMs
 }
 
 function pollConsume(widget) {
   if (pollState.leader === widget) return null
-  return { rows: pollState.rows, updated: pollState.updated, error: pollState.error }
+  return { rows: pollState.rows, updated: pollState.updated, error: pollState.error, seq: pollState.seq }
 }
 
 function pollLeaderInstance() {
   return pollState.leader
+}
+
+// ------------------------------------------------------------- retries
+
+// Escalating backoff between failed checks: hammering an already
+// rate-limited (or unreachable) API only deepens the hole. Four retries,
+// then the failure stands until the next scheduled check.
+var RETRY_BACKOFF_SEC = [30, 60, 120, 300]
+
+function retryBackoffMs(retryNumber) {
+  var i = Math.max(1, Math.min(RETRY_BACKOFF_SEC.length, Math.round(Number(retryNumber) || 1))) - 1
+  return RETRY_BACKOFF_SEC[i] * 1000
+}
+
+// ----------------------------------------------------- failure reasons
+
+// Map a failed curl run to a short human reason. curl -f exits 22 on
+// HTTP >= 400 with the status on stderr ("...returned error: 429"); the
+// exit codes below are curl's own (DNS, connect, timeout, TLS).
+function describeFetchFailure(exitCode, stderrText) {
+  var err = String(stderrText || "").replace(/\s+/g, " ").replace(/^ | $/g, "")
+  var m = err.match(/error: (\d{3})/)
+  if (m) return "CoinGecko HTTP " + m[1] + (m[1] === "429" ? " (rate limited)" : "")
+  var code = Math.round(Number(exitCode) || 0)
+  if (code === 6) return "DNS lookup failed"
+  if (code === 7) return "could not connect"
+  if (code === 28) return "timed out"
+  if (code === 22) return "CoinGecko HTTP error"
+  if (code === 60 || code === 35) return "TLS error"
+  if (code > 0) return "curl exit " + code
+  return "malformed response"
 }

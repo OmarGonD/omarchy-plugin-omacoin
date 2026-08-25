@@ -87,12 +87,12 @@ Panel {
     onTriggered: root.nowTick = new Date()
   }
 
-  // Seconds left in the post-refresh lockout. CoinGecko's public API
-  // tolerates roughly one call per minute, so the manual refresh icon
-  // shows soft red (and ignores clicks) for 60s after each successful
-  // check. Zero when the last check is older, or never happened.
+  // Seconds left in the post-refresh lockout, read from the same shared
+  // gate every fetch path funnels through (Model.pollState), so the
+  // button's color can never disagree with what the fetch choke point
+  // will actually allow. Zero when no check has ever succeeded.
   readonly property real cooldownRemaining: lastUpdated.getTime() > 0
-    ? Math.max(0, 60 - (nowTick.getTime() - lastUpdated.getTime()) / 1000)
+    ? Model.pollCooldownRemaining(nowTick.getTime())
     : 0
 
   // ---- trend state
@@ -183,29 +183,35 @@ Panel {
   }
 
   function setInterval(minutes) {
+    // Assign locally too: the committed value round-trips through
+    // shell.json and back via syncFromHost (up to a second), during
+    // which the slider binding would otherwise snap back to the old rung.
+    intervalMin = Model.clampInterval(minutes)
     if (hostWidget && typeof hostWidget.updateSetting === "function")
-      hostWidget.updateSetting("intervalMin", Model.clampInterval(minutes))
+      hostWidget.updateSetting("intervalMin", intervalMin)
     Qt.callLater(syncFromHost)
   }
 
   function setFlatThreshold(pct) {
+    // Same instant-feedback reasoning as setInterval.
+    flatThresholdPct = Model.clampFlat(pct)
     if (hostWidget && typeof hostWidget.updateSetting === "function")
-      hostWidget.updateSetting("flatThresholdPct", Model.clampFlat(pct))
+      hostWidget.updateSetting("flatThresholdPct", flatThresholdPct)
     Qt.callLater(syncFromHost)
   }
 
   onPrimaryChanged: {
     // Never show the previous coin's chart under the new primary's name:
     // drop what we have, cancel any in-flight fetch for the old coin, and
-    // pull fresh data for the new one.
+    // pull fresh data for the new one. Deferred past the event loop so
+    // the Process teardown below has fully cleared `running` — an
+    // immediate refreshCharts() could see the stale flag and silently
+    // skip the new primary's fetch.
     chartPrices = []
     chartProc.activeId = ""
     chartProc.running = false
-    if (opened) refreshCharts()
+    if (opened) Qt.callLater(refreshCharts)
   }
-
-  onOpenedChanged: if (opened) refreshCharts()
-
   Process {
     id: chartProc
     property string activeId: ""
@@ -660,9 +666,15 @@ Panel {
 
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Escape) {
-                  text = ""
-                  root.searchResults = []
-                  event.accepted = true
+                  // First Esc clears the query (and returns focus so the
+                  // panel's key catcher can act); with nothing typed,
+                  // let it bubble so Esc closes the panel as usual.
+                  if (text !== "") {
+                    text = ""
+                    root.searchResults = []
+                    root.forceActiveFocus()
+                    event.accepted = true
+                  }
                 }
               }
             }
@@ -672,14 +684,6 @@ Panel {
 
               delegate: Rectangle {
                 id: resultRow
-                required property var modelData
-                width: parent ? parent.width : 0
-                implicitHeight: Style.space(34)
-                radius: Style.cornerRadius
-                color: resultMouse.containsMouse
-                  ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
-                  : "transparent"
-
                 // Before the RowLayout, same z-order rule as coin rows.
                 MouseArea {
                   id: resultMouse
