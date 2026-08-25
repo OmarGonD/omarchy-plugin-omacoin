@@ -39,11 +39,19 @@ BarWidget {
   onSettingsChanged: applySettings()
   Component.onCompleted: applySettings()
 
-  // What the bar paints: symbol plus price. The price itself is colored by
-  // the 24h direction — tinted green when up, tinted red when down, and
-  // plain foreground when the move is minimal (|24h| < 0.05%).
+  // What the bar paints: symbol, price, and a direction glyph. The price
+  // itself is colored by the 24h direction — tinted green when up, tinted
+  // red when down, and plain foreground when the move is minimal
+  // (|24h| < 0.05%). The glyph carries the same signal for glanceability
+  // and stays visible even on themes where the tint reads weakly.
   readonly property string labelSymbol: primaryRow ? primaryRow.symbol : ""
   readonly property string labelPrice: primaryRow && primaryRow.price !== null ? Model.formatUsd(primaryRow.price) : ""
+  readonly property string labelDirection: {
+    if (!primaryRow || primaryRow.change24h === null) return "·"
+    if (primaryRow.change24h > 0.05) return "▲"
+    if (primaryRow.change24h < -0.05) return "▼"
+    return "·"
+  }
   readonly property color priceColor: {
     if (!primaryRow || primaryRow.change24h === null) return root.bar ? root.bar.barForeground : Color.foreground
     var change = primaryRow.change24h
@@ -218,6 +226,15 @@ BarWidget {
       font.bold: true
     }
 
+    Text {
+      visible: !root.vertical
+      anchors.verticalCenter: parent.verticalCenter
+      text: root.labelDirection
+      color: root.priceColor
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: Style.font.bodySmall
+    }
+
     // Vertical bars get the compact form: symbol over price.
     Column {
       visible: root.vertical
@@ -234,7 +251,7 @@ BarWidget {
 
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
-        text: root.labelPrice
+        text: root.labelPrice + " " + root.labelDirection
         color: root.priceColor
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
