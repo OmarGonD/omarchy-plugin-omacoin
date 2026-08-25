@@ -39,13 +39,18 @@ BarWidget {
   onSettingsChanged: applySettings()
   Component.onCompleted: applySettings()
 
-  // What the bar paints.
+  // What the bar paints: symbol plus price. The price itself is colored by
+  // the 24h direction — tinted green when up, tinted red when down, and
+  // plain foreground when the move is minimal (|24h| < 0.05%).
   readonly property string labelSymbol: primaryRow ? primaryRow.symbol : ""
   readonly property string labelPrice: primaryRow && primaryRow.price !== null ? Model.formatUsd(primaryRow.price) : ""
-  readonly property string labelChange: primaryRow && primaryRow.change24h !== null ? Model.formatPct(primaryRow.change24h) : ""
-  readonly property color changeColor: primaryRow && primaryRow.change24h !== null
-    ? (primaryRow.change24h >= 0 ? "#7fc983" : "#d4776f")
-    : Color.muted
+  readonly property color priceColor: {
+    if (!primaryRow || primaryRow.change24h === null) return root.bar ? root.bar.barForeground : Color.foreground
+    var change = primaryRow.change24h
+    if (change > 0.05) return "#7fc983"
+    if (change < -0.05) return "#d4776f"
+    return root.bar ? root.bar.barForeground : Color.foreground
+  }
 
   function injectPanel() {
     var target = panelLoader.item
@@ -207,19 +212,10 @@ BarWidget {
       visible: !root.vertical
       anchors.verticalCenter: parent.verticalCenter
       text: root.labelPrice
-      color: root.bar ? root.bar.barForeground : Color.foreground
+      color: root.priceColor
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.body
       font.bold: true
-    }
-
-    Text {
-      visible: !root.vertical && root.labelChange !== ""
-      anchors.verticalCenter: parent.verticalCenter
-      text: root.labelChange
-      color: root.changeColor
-      font.family: root.bar ? root.bar.fontFamily : Style.font.family
-      font.pixelSize: Style.font.bodySmall
     }
 
     // Vertical bars get the compact form: symbol over price.
@@ -239,7 +235,7 @@ BarWidget {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: root.labelPrice
-        color: root.bar ? root.bar.barForeground : Color.foreground
+        color: root.priceColor
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
         font.bold: true
