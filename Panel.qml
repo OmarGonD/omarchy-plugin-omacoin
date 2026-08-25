@@ -1,0 +1,669 @@
+import QtQuick
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+import "Model.js" as Model
+
+// OmaCoin detail popup: primary-coin hero with a 1h/1d/1w trend line, the
+// tracked-coin list (price, volume, 1h/24h/7d change, make-primary and
+// remove actions), CoinGecko search for adding coins, and the check
+// frequency picker. All mutations go through the host BarWidget so they
+// land in the widget's shell.json entry and every bar instance syncs.
+Panel {
+  id: root
+  moduleName: "crueber.omacoin"
+  ipcTarget: "crueber.omacoin"
+  manageIpc: false
+
+  property var anchorItem: null
+  property var hostWidget: null
+  readonly property var barIdentity: hostWidget || root
+
+  // ---- popup state
+  property string trendRange: "1d" // "1h" | "1d" | "1w"
+  property var chartPrices: []     // market_chart (5-minutely, last day) for the primary
+  property var searchResults: []
+
+  // ---- host state, pulled from the BarWidget
+  //
+  // `hostWidget` is a var, so bindings through it (hostWidget.marketRows)
+  // don't re-evaluate when the host's own properties change. The panel
+  // pulls a copy instead: on open, on refresh, and once a second while
+  // open (cheap, and it also catches settings round-trips from other bar
+  // instances).
+  property var rows: []
+  property var primaryRow: null
+  property var trackedCoins: []
+  property string primary: ""
+  property int intervalMin: 60
+  property date lastUpdated: new Date(0)
+
+  function syncFromHost() {
+    if (!hostWidget) return
+    rows = hostWidget.marketRows
+    primaryRow = hostWidget.primaryRow
+    trackedCoins = hostWidget.trackedCoins
+    primary = hostWidget.primary
+    intervalMin = hostWidget.intervalMin
+    lastUpdated = hostWidget.lastUpdated
+  }
+
+  onHostWidgetChanged: syncFromHost()
+
+  Timer {
+    interval: 1000
+    running: root.opened
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.syncFromHost()
+  }
+
+  // ---- trend state
+  readonly property var trendSeries: {
+    if (trendRange === "1h") return Model.windowPoints(chartPrices, 60)
+    if (trendRange === "1d") return chartPrices.map(function(p) { return p[1] })
+    return primaryRow && primaryRow.spark7d ? primaryRow.spark7d : []
+  }
+  readonly property var trendChange: Model.seriesChange(trendSeries)
+
+  // Semantic up/down colors. Omarchy themes only ship neutral + urgent, so
+  // the pair is fixed here to keep up/down distinguishable on any theme.
+  readonly property color upColor: "#7fc983"
+  readonly property color downColor: "#d4776f"
+  readonly property color trendColor: trendChange === null
+    ? Color.muted
+    : (trendChange >= 0 ? upColor : downColor)
+
+  readonly property string searchText: addField.text.replace(/^\s+|\s+$/g, "").toLowerCase()
+
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    return false
+  }
+
+  function open() {
+    root.controller.show()
+    root.syncFromHost()
+    root.refresh()
+  }
+
+  function openFromHotkey() {
+    root.open()
+  }
+
+  function refresh() {
+    // Markets come from the host widget's poll loop; a manual refresh
+    // (open, right click, "r") asks it to re-check now.
+    root.syncFromHost()
+    if (hostWidget && typeof hostWidget.refresh === "function") hostWidget.refresh()
+    refreshCharts()
+  }
+
+  // market_chart days=1 gives 5-minutely points: the raw material for both
+  // the 1h window (last 12 points) and the 1d line. One extra call per
+  // primary coin, only while the panel is being used.
+  function refreshCharts() {
+    if (!primary || chartProc.running) return
+    chartProc.command = ["curl", "-fsS", "--max-time", "15",
+      "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
+      + "/market_chart?vs_currency=usd&days=1"]
+    chartProc.running = true
+  }
+
+  function runSearch() {
+    if (searchText === "") {
+      searchResults = []
+      return
+    }
+    if (searchProc.running) return
+    searchProc.activeQuery = searchText
+    searchProc.command = ["curl", "-fsS", "--max-time", "10",
+      "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText)]
+    searchProc.running = true
+  }
+  function addCoin(id) {
+    if (hostWidget && typeof hostWidget.addCoin === "function") hostWidget.addCoin(id)
+    addField.text = ""
+    searchResults = []
+    Qt.callLater(syncFromHost)
+  }
+
+  function removeCoin(id) {
+    if (hostWidget && typeof hostWidget.removeCoin === "function") hostWidget.removeCoin(id)
+    Qt.callLater(syncFromHost)
+  }
+
+  function setPrimary(id) {
+    if (hostWidget && typeof hostWidget.updateSetting === "function")
+      hostWidget.updateSetting("primary", id)
+    Qt.callLater(syncFromHost)
+  }
+
+
+  function setInterval(minutes) {
+    if (hostWidget && typeof hostWidget.updateSetting === "function")
+      hostWidget.updateSetting("intervalMin", minutes)
+    Qt.callLater(syncFromHost)
+  }
+
+  onPrimaryChanged: {
+    // Never show the previous coin's chart under the new primary's name.
+    chartPrices = []
+    if (opened) refreshCharts()
+  }
+
+  onOpenedChanged: if (opened) refreshCharts()
+
+  Process {
+    id: chartProc
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.chartPrices = Model.parseMarketChart(text)
+    }
+  }
+
+  Process {
+    id: searchProc
+    property string activeQuery: ""
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var results = Model.parseSearch(text)
+        var filtered = []
+        for (var i = 0; i < results.length && filtered.length < 8; i++) {
+          if (root.trackedCoins.indexOf(results[i].id) < 0) filtered.push(results[i])
+        }
+        root.searchResults = filtered
+        // The query moved on while this fetch was in flight — fetch the
+        // latest one right after (weather's geocoder pattern).
+        if (root.searchText !== searchProc.activeQuery) searchDebounce.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: searchDebounce
+    interval: 400
+    onTriggered: root.runSearch()
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: root.anchorItem
+    owner: root.barIdentity
+    bar: root.bar
+    open: root.opened
+    centerOnBar: true
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(480))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: addField.activeFocus || freqDropdown.popupOpen
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refresh()
+        else if (t === "t" || t === "T") {
+          var order = ["1h", "1d", "1w"]
+          root.trendRange = order[(order.indexOf(root.trendRange) + 1) % order.length]
+        }
+      }
+
+      Flickable {
+        id: scroll
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        Column {
+          id: column
+          width: scroll.width
+          spacing: Style.space(14)
+
+          // ------------------------------------------------------ hero
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(heroLeft.implicitHeight, heroRight.implicitHeight)
+
+            Column {
+              id: heroLeft
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                text: root.primaryRow ? root.primaryRow.name : "OmaCoin"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.heading
+                font.bold: true
+                elide: Text.ElideRight
+                width: Math.min(implicitWidth, Style.space(300))
+              }
+
+              Text {
+                text: root.primaryRow
+                  ? (root.primaryRow.symbol + " · USD · VOL " + Model.formatCompactUsd(root.primaryRow.vol24h))
+                  : "CoinGecko · USD"
+                color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 0.5
+              }
+            }
+
+            Column {
+              id: heroRight
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(2)
+
+              Text {
+                anchors.right: parent.right
+                text: root.primaryRow && root.primaryRow.price !== null ? Model.formatUsd(root.primaryRow.price) : "—"
+                color: root.bar ? root.bar.foreground : Color.foreground
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.display
+                font.bold: true
+              }
+
+              Text {
+                anchors.right: parent.right
+                visible: root.primaryRow && root.primaryRow.change24h !== null
+                text: root.primaryRow ? "24h " + Model.formatPct(root.primaryRow.change24h) : ""
+                color: root.primaryRow && root.primaryRow.change24h >= 0 ? root.upColor : root.downColor
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.subtitle
+                font.bold: true
+              }
+            }
+          }
+
+          // ------------------------------------------------- trend line
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+
+            Item {
+              width: parent.width
+              height: Math.max(trendHeaderLabel.implicitHeight, trendButtons.implicitHeight)
+
+              PanelSectionHeader {
+                id: trendHeaderLabel
+                text: "TREND"
+                foreground: root.bar ? root.bar.foreground : Color.foreground
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Row {
+                id: trendButtons
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: [
+                    { key: "1h", label: "1H" },
+                    { key: "1d", label: "1D" },
+                    { key: "1w", label: "1W" }
+                  ]
+
+                  Button {
+                    required property var modelData
+                    text: modelData.label
+                    selected: root.trendRange === modelData.key
+                    foreground: root.bar ? root.bar.foreground : Color.foreground
+                    fontSize: Style.font.bodySmall
+                    horizontalPadding: Style.spacing.sm
+                    verticalPadding: Style.spacing.xxs
+                    onClicked: root.trendRange = modelData.key
+                  }
+                }
+              }
+            }
+
+            Sparkline {
+              width: parent.width
+              height: Style.space(88)
+              series: root.trendSeries
+              lineColor: root.trendColor
+            }
+
+            Text {
+              visible: root.trendSeries.length > 0
+              width: parent.width
+              horizontalAlignment: Text.AlignRight
+              text: {
+                var label = root.trendRange === "1h" ? "past hour" : (root.trendRange === "1d" ? "past day" : "past week")
+                return root.trendChange !== null ? Model.formatPct(root.trendChange) + " (" + label + ")" : label
+              }
+              color: root.trendColor
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              visible: root.trendSeries.length === 0
+              width: parent.width
+              text: root.primaryRow ? "Loading trend…" : "No coin selected."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+          // ---------------------------------------------- tracked coins
+          PanelSectionHeader {
+            text: "TRACKED · " + root.rows.length
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+          }
+
+          Text {
+            visible: root.trackedCoins.length === 0
+            width: parent.width
+            text: "No coins tracked. Search below to add one."
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: root.trackedCoins.length > 0 && root.rows.length === 0
+            width: parent.width
+            text: "Waiting for CoinGecko data…"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Repeater {
+            model: root.rows
+
+            delegate: Rectangle {
+              id: coinRow
+              required property var modelData
+              width: parent ? parent.width : 0
+              implicitHeight: Style.space(52)
+              radius: Style.cornerRadius
+              color: rowMouse.containsMouse || modelData.id === root.primary
+                ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                : "transparent"
+
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(4)
+                spacing: Style.space(10)
+
+                ColumnLayout {
+                  Layout.fillWidth: true
+                  spacing: Style.space(2)
+
+                  Row {
+                    spacing: Style.space(6)
+
+                    Text {
+                      text: coinRow.modelData.symbol
+                      color: root.bar ? root.bar.foreground : Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    Text {
+                      text: coinRow.modelData.name
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                      width: Math.min(implicitWidth, Style.space(150))
+                    }
+                  }
+
+                  Text {
+                    text: "1h " + Model.formatPct(coinRow.modelData.change1h)
+                      + "  ·  24h " + Model.formatPct(coinRow.modelData.change24h)
+                      + "  ·  7d " + Model.formatPct(coinRow.modelData.change7d)
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Column {
+                  Layout.alignment: Qt.AlignVCenter
+                  spacing: Style.space(2)
+
+                  Text {
+                    anchors.right: parent.right
+                    text: coinRow.modelData.price !== null ? Model.formatUsd(coinRow.modelData.price) : "—"
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.body
+                    font.bold: true
+                  }
+
+                  Text {
+                    anchors.right: parent.right
+                    text: "VOL " + Model.formatCompactUsd(coinRow.modelData.vol24h)
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                PanelActionButton {
+                  iconText: coinRow.modelData.id === root.primary ? "★" : "☆"
+                  tooltipText: coinRow.modelData.id === root.primary ? "Primary coin" : "Make primary"
+                  foreground: coinRow.modelData.id === root.primary ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
+                  onClicked: root.setPrimary(coinRow.modelData.id)
+                }
+
+                PanelActionButton {
+                  iconText: "✕"
+                  tooltipText: "Remove " + coinRow.modelData.name
+                  hoverColor: Color.urgent
+                  onClicked: root.removeCoin(coinRow.modelData.id)
+                }
+              }
+
+              MouseArea {
+                id: rowMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                acceptedButtons: Qt.LeftButton
+                // Clicks on the action buttons must not double-fire.
+                onClicked: function(mouse) {
+                  if (mouse.x >= coinRow.width - Style.space(96)) return
+                  root.setPrimary(coinRow.modelData.id)
+                }
+              }
+            }
+          }
+
+          Text {
+            visible: root.rows.length > 0
+            width: parent.width
+            text: "Click a coin to make it the primary shown in the bar."
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+          // ---------------------------------------------------- add coin
+          PanelSectionHeader {
+            text: "ADD COIN"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+          }
+
+          TextField {
+            id: addField
+            width: parent.width
+            placeholderText: "Search CoinGecko (name or symbol)"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            onTextChanged: searchDebounce.restart()
+
+            Keys.onPressed: function(event) {
+              if (event.key === Qt.Key_Escape) {
+                text = ""
+                root.searchResults = []
+                event.accepted = true
+              }
+            }
+          }
+
+          Repeater {
+            model: root.searchResults
+
+            delegate: Rectangle {
+              id: resultRow
+              required property var modelData
+              width: parent ? parent.width : 0
+              implicitHeight: Style.space(34)
+              radius: Style.cornerRadius
+              color: resultMouse.containsMouse
+                ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                : "transparent"
+
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(4)
+                spacing: Style.space(10)
+
+                Text {
+                  Layout.fillWidth: true
+                  text: resultRow.modelData.name + " (" + resultRow.modelData.symbol + ")"
+                  color: root.bar ? root.bar.foreground : Color.foreground
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  visible: resultRow.modelData.rank !== null
+                  text: "#" + resultRow.modelData.rank
+                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                PanelActionButton {
+                  iconText: "＋"
+                  tooltipText: "Track " + resultRow.modelData.name
+                  onClicked: root.addCoin(resultRow.modelData.id)
+                }
+              }
+
+              MouseArea {
+                id: resultMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.addCoin(resultRow.modelData.id)
+              }
+            }
+          }
+
+          PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
+
+          // --------------------------------------------- check frequency
+          PanelSectionHeader {
+            text: "CHECK FREQUENCY"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+          }
+
+          Dropdown {
+            id: freqDropdown
+            width: parent.width
+            label: ""
+            showLabel: false
+            foreground: Color.popups.text
+            background: Color.popups.background
+            value: String(root.intervalMin)
+            options: Model.intervalOptions()
+            onChanged: function(value) { root.setInterval(Number(value)) }
+          }
+
+          Text {
+            width: parent.width
+            text: "CoinGecko's public API accepts one call per minute at most, so the ladder " +
+              "runs from 1 minute up to once per day. Each check is a single call for every tracked coin."
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            text: "Updated " + Model.formatTime(root.lastUpdated)
+              + " · every " + Model.intervalLabel(root.intervalMin)
+              + " · Data from CoinGecko"
+            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+        }
+      }
+    }
+  }
+
+  component Sparkline: Canvas {
+    id: canvas
+    property var series: []
+    property color lineColor: Color.accent
+
+    onSeriesChanged: requestPaint()
+    onWidthChanged: requestPaint()
+    onHeightChanged: requestPaint()
+    onLineColorChanged: requestPaint()
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.clearRect(0, 0, width, height)
+      var pts = Model.sparkPoints(series, width, height, 3)
+      if (pts.length < 2) return
+
+      // Area fill under the line.
+      ctx.beginPath()
+      ctx.moveTo(pts[0].x, pts[0].y)
+      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
+      ctx.lineTo(pts[pts.length - 1].x, height)
+      ctx.lineTo(pts[0].x, height)
+      ctx.closePath()
+      ctx.fillStyle = Qt.rgba(lineColor.r, lineColor.g, lineColor.b, 0.14)
+      ctx.fill()
+
+      // The line itself.
+      ctx.beginPath()
+      ctx.moveTo(pts[0].x, pts[0].y)
+      for (var j = 1; j < pts.length; j++) ctx.lineTo(pts[j].x, pts[j].y)
+      ctx.strokeStyle = lineColor
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+  }
+}

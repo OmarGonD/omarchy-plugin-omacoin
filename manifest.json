@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "crueber.omacoin",
+  "name": "OmaCoin",
+  "version": "1.0.0",
+  "author": "crueber",
+  "license": "MIT",
+  "description": "CoinGecko crypto tracker: primary coin price in the bar, popup with tracked coins, USD price, volume, and 1h/1d/1w trend lines.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaCoin",
+    "description": "Crypto prices from CoinGecko — primary coin in the bar, tracked list with trends in the popup.",
+    "category": "Finance",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "coins": ["bitcoin", "ethereum"],
+      "primary": "bitcoin",
+      "intervalMin": 60
+    },
+    "schema": [
+      {
+        "key": "primary",
+        "type": "string",
+        "label": "Primary coin",
+        "description": "CoinGecko id of the coin shown in the bar (bitcoin, ethereum, solana, ...)."
+      },
+      {
+        "key": "intervalMin",
+        "type": "integer",
+        "label": "Check frequency (minutes)",
+        "description": "How often to poll CoinGecko. The public API accepts one call per minute at most; the ladder runs from 1 minute up to once per day. Default: 60 (once per hour).",
+        "min": 1,
+        "max": 1440,
+        "step": 1,
+        "defaultValue": 60
+      }
+    ]
+  }
+}
