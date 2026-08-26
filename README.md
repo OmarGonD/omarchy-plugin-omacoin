@@ -1,8 +1,6 @@
 # OmaCoin
 
-![OmaCoin panel](preview.png)
-
-![OmaCoin — the full popup: hero, trend, tracked list, add-coin search](example.png)
+![OmaCoin — the popup over the bar: hero, trend, tracked list, add-coin search](preview.png)
 
 An [Omarchy](https://omarchy.org/) shell plugin that tracks crypto prices via
 the [CoinGecko](https://www.coingecko.com/) public API.
