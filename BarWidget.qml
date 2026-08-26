@@ -149,6 +149,10 @@ BarWidget {
     }
   }
 
+  function close() {
+    if (panelLoader.item) panelLoader.item.close()
+  }
+
   function togglePanel() {
     if (panelLoader.item && panelLoader.item.toggle) panelLoader.item.toggle()
     else if (!panelLoader.item) {
