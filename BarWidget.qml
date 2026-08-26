@@ -212,13 +212,17 @@ BarWidget {
     root.updateSetting("coins", next)
   }
 
-  // Untrack a coin. The primary's fallback is computed against the OLD
-  // primary and written in the same entry — writing it after `coins` would
-  // compare against the already-updated primary and never fire.
+  // Untrack a coin. Normalized like addCoin so mixed-case ids from IPC
+  // still match ("Bitcoin" must hit the stored "bitcoin"). The primary's
+  // fallback is computed against the OLD primary and written in the same
+  // entry — writing it after `coins` would compare against the
+  // already-updated primary and never fire.
   function removeCoin(id) {
+    var gone = String(id || "").replace(/^\s+|\s+$/g, "").toLowerCase()
+    if (gone === "") return
     var current = root.trackedCoins.slice()
     var next = []
-    for (var i = 0; i < current.length; i++) if (current[i] !== id) next.push(current[i])
+    for (var i = 0; i < current.length; i++) if (current[i] !== gone) next.push(current[i])
     if (next.length === current.length) return
     root.updateSettings({ coins: next, primary: Model.primaryId(next, root.primary) })
   }

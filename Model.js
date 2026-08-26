@@ -45,7 +45,7 @@ function intervalIndex(minutes) {
   for (var i = 0; i < INTERVAL_LADDER.length; i++) {
     if (INTERVAL_LADDER[i] === target) return i
   }
-  return 5
+  return INTERVAL_LADDER.indexOf(60)
 }
 
 function ladderAt(i) {
