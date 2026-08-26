@@ -32,6 +32,17 @@ Panel {
   property var chartPrices: []       // market_chart (5-minutely, last day) for the primary
   property string chartError: ""     // why the trend chart is unavailable, when it is
   property var searchResults: []
+  // Tracked coins that have no market row yet — added moments ago, or
+  // added while the rate-limit gate deferred their first fetch. Shown as
+  // placeholder rows so adding a coin always has immediate feedback.
+  readonly property var pendingCoins: {
+    var have = {}
+    for (var i = 0; i < rows.length; i++) have[rows[i].id] = true
+    var out = []
+    for (var j = 0; j < trackedCoins.length; j++)
+      if (!have[trackedCoins[j]]) out.push(trackedCoins[j])
+    return out
+  }
 
   // Slider drag previews: -1 means "not dragging, show the committed
   // value". Committed only on release so shell.json is written once per
@@ -568,7 +579,7 @@ Panel {
 
             // ---------------------------------------------- tracked coins
             PanelSectionHeader {
-              text: "TRACKED · " + root.rows.length
+              text: "TRACKED · " + root.trackedCoins.length
               foreground: root.bar ? root.bar.foreground : Color.foreground
             }
 
@@ -693,6 +704,59 @@ Panel {
                     tooltipText: "Remove " + coinRow.modelData.name
                     hoverColor: Color.urgent
                     onClicked: root.removeCoin(coinRow.modelData.id)
+                  }
+                }
+              }
+            }
+
+            // Tracked but not yet fetched: added inside the rate-limit
+            // window, so their first data lands when the deferred fetch
+            // fires (up to 60s). A visible placeholder beats a dead click.
+            Repeater {
+              model: root.pendingCoins
+
+              delegate: Rectangle {
+                id: pendingRow
+                required property string modelData
+                width: parent ? parent.width : 0
+                implicitHeight: Style.space(52)
+                radius: Style.cornerRadius
+                color: "transparent"
+                border.color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 2.2)
+                border.width: 1
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(4)
+                  spacing: Style.space(10)
+
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: Style.space(2)
+
+                    Text {
+                      text: pendingRow.modelData
+                      color: root.bar ? root.bar.foreground : Color.foreground
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      elide: Text.ElideRight
+                    }
+
+                    Text {
+                      text: "waiting for first price · rate-limit cooldown"
+                      color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+                      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  PanelActionButton {
+                    iconText: "✕"
+                    tooltipText: "Remove " + pendingRow.modelData
+                    hoverColor: Color.urgent
+                    onClicked: root.removeCoin(pendingRow.modelData)
                   }
                 }
               }

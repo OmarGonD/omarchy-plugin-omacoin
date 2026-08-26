@@ -72,9 +72,15 @@ function flatLabel(pct) {
 // Normalize a coins setting (array, or comma-separated string from a
 // hand-edited shell.json) into a deduplicated lowercase id array.
 function coinList(value) {
+  // QML hands inline shell.json arrays over as QVariantList, which fails
+  // Array.isArray — so duck-type instead: anything with a length and
+  // array-style indexing counts.
   var raw = []
   if (Array.isArray(value)) raw = value.slice()
   else if (typeof value === "string") raw = value.split(",")
+  else if (value && typeof value.length === "number") {
+    for (var v = 0; v < value.length; v++) raw.push(value[v])
+  }
   var seen = {}
   var out = []
   for (var i = 0; i < raw.length; i++) {

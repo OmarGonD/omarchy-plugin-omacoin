@@ -66,7 +66,6 @@ BarWidget {
     if (iv !== intervalMin) intervalMin = iv
     if (flat !== flatThresholdPct) flatThresholdPct = flat
   }
-  onSettingsChanged: applySettings()
   // Suppress the tracked-coins refetch during startup: the poll timer's
   // triggeredOnStart already fetches, so a changed list would only queue
   // a redundant second call.
@@ -139,15 +138,15 @@ BarWidget {
 
   function open() {
     if (panelLoader.item && panelLoader.item.open) {
+      // Re-inject every open: a plugin hot-reload can leave this panel
+      // bound to a destroyed host widget (the popup window outlives the
+      // bar widget tree), which would make every button a silent no-op.
+      injectPanel()
       panelLoader.item.open()
     } else if (!panelLoader.item) {
       pendingOpen = true
       panelRequested = true
     }
-  }
-
-  function close() {
-    if (panelLoader.item) panelLoader.item.close()
   }
 
   function togglePanel() {
@@ -164,14 +163,32 @@ BarWidget {
   }
 
   // ---- shell.json settings writes (clock's updateEntryInline pattern)
+  //
+  // The written entry is built from lastKnownSettings — a snapshot of the
+  // most recent HOST-injected entry — merged with the current settings
+  // and the changes. Building from root.settings alone let a write that
+  // landed while settings were partially injected (hot reload, startup)
+  // permanently drop keys; the snapshot makes that impossible.
+  property var lastKnownSettings: null
+
+  onSettingsChanged: {
+    if (settings && typeof settings === "object") lastKnownSettings = settings
+    applySettings()
+  }
 
   function updateSettings(changes) {
     var entry = { id: root.moduleName }
-    for (var k in root.settings) if (k !== "id") entry[k] = root.settings[k]
+    var sources = [lastKnownSettings, root.settings]
+    for (var s = 0; s < sources.length; s++) {
+      var src = sources[s]
+      if (!src) continue
+      for (var k in src) if (k !== "id" && entry[k] === undefined) entry[k] = src[k]
+    }
     for (var c in changes) entry[c] = changes[c]
     // Applied locally first so the change is visible immediately; the
     // shell.json write comes back through the bar as the same value.
     root.settings = entry
+    lastKnownSettings = entry
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
