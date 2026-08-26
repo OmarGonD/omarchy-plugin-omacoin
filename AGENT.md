@@ -2,7 +2,7 @@
 
 Crypto price tracker plugin (id `crueber.omacoin`) for the Omarchy shell.
 Fetches from CoinGecko's public API via `curl` (Quickshell `Process`), no API key.
-Current version **1.5.1** at commit `2bd16b6` — stable, deployed, and under marketplace review.
+Current version **1.5.2** at commit `4cbe0e7` — stable, deployed, and under marketplace review.
 
 ## Layout
 
@@ -15,7 +15,7 @@ Current version **1.5.1** at commit `2bd16b6` — stable, deployed, and under ma
 
 - **Issue:** https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/2540 (submit-plugin template).
 - State: `submission` + `validated` + `security-review-required`, OPEN, awaiting a maintainer's manual review → `approved-and-verified`.
-- The validation bot pins the commit it checked (`b0bc450`, stale). It only re-runs on **issue-body edits**, not comments. Status updates so far went in as comments naming the current head (`2bd16b6`).
+- The validation bot pins the commit it checked (`b0bc450`, stale). It only re-runs on **issue-body edits**, not comments. Status updates so far went in as comments naming the current head (`4cbe0e7`).
 - Security baseline flagged `remote-build` (the `git clone` install instructions) — expected noise, every Omarchy plugin triggers it, "no change necessarily required."
 - Checklist in the issue body has **5** items (the live template has two more than the version you can fetch via the GitHub API — if validation fails, read the bot's comment for the exact missing item, tick it in the body, and it re-runs one item per pass).
 - Watch for maintainer feedback; respond to any `needs-fixes` requests by fixing on `main`, then comment the new head commit.
@@ -43,9 +43,9 @@ Current version **1.5.1** at commit `2bd16b6` — stable, deployed, and under ma
 
 ## History in one line per commit
 
-`ea875ed` initial · `c0a4814` drop %, tint price · `0730c51` direction glyph · `57c8423` flat band + sliders + tabs + review-1 fixes · `4de3c10` refresh button + cooldown · `1cf62d7` review-2 fixes (gate choke point, seq fan-out) · `c92040c` review-3 (defer gate-blocked, chartGen) · `2d16563` review-3 polish (drain-guard, dedupe queue) · `5f75ea7` marketplace prep · `77554cf`/`b0bc450` preview image · `26da763` search delegate fix · `366399b` QVariantList + snapshot writes + re-inject host · `2bd16b6` restore lost `close()`.
+`ea875ed` initial · `c0a4814` drop %, tint price · `0730c51` direction glyph · `57c8423` flat band + sliders + tabs + review-1 fixes · `4de3c10` refresh button + cooldown · `1cf62d7` review-2 fixes (gate choke point, seq fan-out) · `c92040c` review-3 (defer gate-blocked, chartGen) · `2d16563` review-3 polish (drain-guard, dedupe queue) · `5f75ea7` marketplace prep · `77554cf`/`b0bc450` preview image · `26da763` search delegate fix · `366399b` QVariantList + snapshot writes + re-inject host · `2bd16b6` restore lost `close()` · `ac61621` AGENT.md handoff · `4cbe0e7` review-4 (normalize removeCoin input, intervalIndex fallback rung).
 
-Three Ox Alpha reviews (via `opencode run -m opencode-go/ox-alpha-free` from the repo dir; OpenRouter's `stealth/ox-alpha` is blocked by the account's data policy — use the opencode-go endpoint). Round 3 verdict: **shippable**.
+Four Ox Alpha reviews (via `opencode run -m opencode-go/ox-alpha-free` from the repo dir; OpenRouter's `stealth/ox-alpha` is blocked by the account's data policy — use the opencode-go endpoint). Round 3 verdict: **shippable**.
 
 ## Known non-issues / accepted quirks
 
