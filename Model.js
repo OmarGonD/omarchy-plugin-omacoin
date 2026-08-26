@@ -16,6 +16,35 @@ var INTERVAL_LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 240, 360, 720, 1440]
 // direction": plain foreground, "·" glyph. Default ±0.5%.
 var FLAT_DEFAULT = 0.5
 
+// ---- untrusted-input limits ------------------------------------------
+//
+// Two sources are treated as untrusted: same-user IPC callers (addCoin /
+// removeCoin / setPrimary / hand-edited shell.json) that can persist
+// arbitrarily long values, and CoinGecko responses parsed into long-lived
+// objects in the shared shell process. These caps bound what can be
+// persisted, requested, and retained.
+var COIN_ID_RE = /^[a-z0-9][a-z0-9._-]*$/
+var COIN_ID_MAX_LEN = 64
+var COINS_MAX = 16
+// Producer-side byte cap: every fetch pipes curl through `head -c`, so a
+// hostile or broken endpoint can never stream more than this into memory.
+var RESPONSE_MAX_BYTES = 1048576
+var MARKETS_MAX_ROWS = 50       // COINS_MAX ids are requested; margin for junk rows
+var SEARCH_MAX_RESULTS = 25     // the popup shows 8; parse only the head of the list
+var CHART_MAX_POINTS = 2000     // days=1 is ~288 5-minutely points
+var SPARKLINE_MAX_POINTS = 1000 // sparkline_in_7d is ~168 hourly points
+var NAME_MAX_LEN = 80
+var SYMBOL_MAX_LEN = 24
+
+// Sanitize and bound a remote string before it reaches QML: strips control
+// characters and truncates to maxLen. Rendering layers additionally use
+// Text.PlainText so markup in remote text can never be interpreted.
+function safeString(value, maxLen) {
+  var s = String(value === null || value === undefined ? "" : value).replace(/[\u0000-\u001f\u007f]/g, "")
+  if (s.length > maxLen) s = s.slice(0, maxLen)
+  return s
+}
+
 function intervalLabel(minutes) {
   var m = Number(minutes)
   if (!isFinite(m) || m < 60) return m + (m === 1 ? " minute" : " minutes")
@@ -83,11 +112,18 @@ function coinList(value) {
   }
   var seen = {}
   var out = []
+  // Strict id rules: CoinGecko ids are short lowercase tokens. Anything
+  // outside the charset (or over COIN_ID_MAX_LEN) is dropped, and the
+  // list itself is capped at COINS_MAX — this one loop bounds every input
+  // path at once: IPC addCoin/removeCoin, popup search adds, and a
+  // hand-edited shell.json entry.
   for (var i = 0; i < raw.length; i++) {
     var id = String(raw[i] || "").replace(/^\s+|\s+$/g, "").toLowerCase()
     if (id === "" || seen[id]) continue
+    if (!COIN_ID_RE.test(id) || id.length > COIN_ID_MAX_LEN) continue
     seen[id] = true
     out.push(id)
+    if (out.length >= COINS_MAX) break
   }
   return out
 }
@@ -105,6 +141,10 @@ function primaryId(coins, primarySetting) {
 function parseJson(raw) {
   var text = String(raw || "").replace(/^\s+|\s+$/g, "")
   if (text === "") return null
+  // Belt against oversized payloads reaching JSON.parse even when the
+  // producer-side pipe cap is bypassed. A truncated document fails the
+  // parse and surfaces as a fetch error — correct, not silent.
+  if (text.length > RESPONSE_MAX_BYTES) text = text.slice(0, RESPONSE_MAX_BYTES)
   try { return JSON.parse(text) } catch (e) { return null }
 }
 
@@ -122,13 +162,14 @@ function parseMarkets(raw) {
   var data = parseJson(raw)
   if (!Array.isArray(data)) return null
   var map = {}
-  for (var i = 0; i < data.length; i++) {
+  for (var i = 0; i < data.length && Object.keys(map).length < MARKETS_MAX_ROWS; i++) {
     var r = data[i]
     if (!r || !r.id) continue
-    map[String(r.id)] = {
-      id: String(r.id),
-      symbol: String(r.symbol || r.id).toUpperCase(),
-      name: String(r.name || r.id),
+    var id = safeString(r.id, COIN_ID_MAX_LEN)
+    map[id] = {
+      id: id,
+      symbol: safeString(r.symbol || r.id, SYMBOL_MAX_LEN).toUpperCase(),
+      name: safeString(r.name || r.id, NAME_MAX_LEN),
       price: num(r.current_price),
       vol24h: num(r.total_volume),
       high24h: num(r.high_24h),
@@ -136,7 +177,10 @@ function parseMarkets(raw) {
       change24h: num(num(r.price_change_percentage_24h_in_currency) !== null
         ? r.price_change_percentage_24h_in_currency : r.price_change_percentage_24h),
       change7d: num(r.price_change_percentage_7d_in_currency),
-      spark7d: (r.sparkline_in_7d && Array.isArray(r.sparkline_in_7d.price)) ? r.sparkline_in_7d.price : []
+      // Bounded copy of the remote array; sparkPoints() also ignores any
+      // non-finite entries at draw time.
+      spark7d: (r.sparkline_in_7d && Array.isArray(r.sparkline_in_7d.price))
+        ? r.sparkline_in_7d.price.slice(0, SPARKLINE_MAX_POINTS).map(num) : []
     }
   }
   return map
@@ -162,13 +206,13 @@ function parseSearch(raw) {
   var data = parseJson(raw)
   if (!data || !Array.isArray(data.coins)) return []
   var out = []
-  for (var i = 0; i < data.coins.length; i++) {
+  for (var i = 0; i < data.coins.length && out.length < SEARCH_MAX_RESULTS; i++) {
     var c = data.coins[i]
     if (!c || !c.id) continue
     out.push({
-      id: String(c.id),
-      name: String(c.name || c.id),
-      symbol: String(c.symbol || "").toUpperCase(),
+      id: safeString(c.id, COIN_ID_MAX_LEN),
+      name: safeString(c.name || c.id, NAME_MAX_LEN),
+      symbol: safeString(c.symbol || "", SYMBOL_MAX_LEN).toUpperCase(),
       rank: num(c.market_cap_rank)
     })
   }
@@ -180,7 +224,7 @@ function parseMarketChart(raw) {
   var data = parseJson(raw)
   if (!data || !Array.isArray(data.prices)) return []
   var out = []
-  for (var i = 0; i < data.prices.length; i++) {
+  for (var i = 0; i < data.prices.length && out.length < CHART_MAX_POINTS; i++) {
     var p = data.prices[i]
     if (!Array.isArray(p) || p.length < 2) continue
     var price = num(p[1])
@@ -389,6 +433,7 @@ function describeFetchFailure(exitCode, stderrText) {
   if (code === 28) return "timed out"
   if (code === 22) return "CoinGecko HTTP error"
   if (code === 60 || code === 35) return "TLS error"
+  if (code === 141) return "response too large"
   if (code > 0) return "curl exit " + code
   return "malformed response"
 }

@@ -37,11 +37,25 @@ the price in plain white with a `·` glyph instead of a tint. The slider runs
 from **0% (no flat band — every move tints) up to 5%** in 0.1% steps.
 Default: **±0.5%**.
 
+## Limits
+
+The plugin treats its two untrusted inputs accordingly:
+
+- **Tracked coins**: ids from IPC, the popup, or a hand-edited `shell.json`
+  are normalized and validated against CoinGecko's id format (lowercase,
+  ≤64 chars) and the list is capped at **16 coins** — so config growth is
+  bounded no matter who writes to it.
+- **Responses**: every API response is piped through a producer-side byte
+  cap (1 MiB) before it reaches the shell's memory, parsed result arrays
+  and sparkline data are bounded, and remote strings are sanitized and
+  rendered as plain text.
+
 ## State
 
 Everything lives inline on the widget's entry in `~/.config/omarchy/shell.json`:
 
-- `coins` — tracked CoinGecko ids (default: `["bitcoin", "ethereum"]`)
+- `coins` — tracked CoinGecko ids (default: `["bitcoin", "ethereum"]`;
+  capped at 16, ids restricted to CoinGecko's lowercase id format)
 - `primary` — coin shown in the bar (default: `"bitcoin"`)
 - `intervalMin` — check frequency in minutes, snapped to the ladder
   (default: `60`)

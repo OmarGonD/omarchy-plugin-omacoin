@@ -327,9 +327,16 @@ BarWidget {
       return
     }
     marketsProc.requestedIds = ids
-    marketsProc.command = ["curl", "-fsS", "--max-time", "15",
-      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
-      + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d"]
+    // Producer-side byte cap: curl pipes through `head -c`, so no more
+    // than RESPONSE_MAX_BYTES ever reaches the shell's memory. `pipefail`
+    // keeps curl's own exit code (DNS/429/timeout diagnostics intact); an
+    // over-cap stream surfaces as a failed check. Single quotes are safe —
+    // encodeURIComponent escapes them and every literal segment is fixed.
+    marketsProc.command = ["bash", "-o", "pipefail", "-c",
+      "curl -fsS --compressed --max-time 15 '"
+      + "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
+      + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d"
+      + "' | head -c " + Model.RESPONSE_MAX_BYTES]
     marketsProc.running = true
   }
 
@@ -442,7 +449,9 @@ BarWidget {
     // same clamps the popup applies.
     function addCoin(id: string): void { root.addCoin(id) }
     function removeCoin(id: string): void { root.removeCoin(id) }
-    function setPrimary(id: string): void { root.updateSetting("primary", id) }
+    // Normalized against the tracked list: junk ids from IPC cannot reach
+    // shell.json as `primary` (invalid values fall back to coins[0]).
+    function setPrimary(id: string): void { root.updateSetting("primary", Model.primaryId(root.trackedCoins, id)) }
     function setIntervalMin(minutes: int): void { root.updateSetting("intervalMin", Model.clampInterval(minutes)) }
     function setFlatThreshold(pct: real): void { root.updateSetting("flatThresholdPct", Model.clampFlat(pct)) }
   }
@@ -459,6 +468,7 @@ BarWidget {
       color: Qt.darker(root.bar ? root.bar.barForeground : Color.foreground, 1.3)
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.body
+      textFormat: Text.PlainText
     }
 
     Text {
@@ -509,6 +519,7 @@ BarWidget {
         anchors.horizontalCenter: parent.horizontalCenter
         text: root.hasData ? (root.labelPrice + " " + root.labelDirection) : "—"
         color: root.priceColor
+        textFormat: Text.PlainText
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall
         font.bold: true

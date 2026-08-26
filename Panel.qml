@@ -166,9 +166,14 @@ Panel {
     chartProc.gen = root.chartGen
     chartProc.activeId = primary
     chartError = ""
-    chartProc.command = ["curl", "-fsS", "--max-time", "15",
-      "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
-      + "/market_chart?vs_currency=usd&days=1"]
+    // Same producer-side byte cap as the host's markets fetch (see
+    // BarWidget.marketsFetch): pipefail keeps curl's diagnostics, head -c
+    // bounds what reaches memory. Single quotes are safe — the URL is
+    // fixed segments plus encodeURIComponent output.
+    chartProc.command = ["bash", "-o", "pipefail", "-c",
+      "curl -fsS --compressed --max-time 15 '"
+      + "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
+      + "/market_chart?vs_currency=usd&days=1' | head -c " + Model.RESPONSE_MAX_BYTES]
     chartProc.running = true
   }
 
@@ -179,8 +184,10 @@ Panel {
     }
     if (searchProc.running) return
     searchProc.activeQuery = searchText
-    searchProc.command = ["curl", "-fsS", "--max-time", "10",
-      "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText)]
+    searchProc.command = ["bash", "-o", "pipefail", "-c",
+      "curl -fsS --compressed --max-time 10 '"
+      + "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText)
+      + "' | head -c " + Model.RESPONSE_MAX_BYTES]
     searchProc.running = true
   }
 
@@ -451,6 +458,7 @@ Panel {
                 spacing: Style.space(2)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.primaryRow ? root.primaryRow.name : "OmaCoin"
                   color: root.bar ? root.bar.foreground : Color.foreground
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -468,6 +476,7 @@ Panel {
                   font.family: root.bar ? root.bar.fontFamily : Style.font.family
                   font.pixelSize: Style.font.caption
                   font.letterSpacing: 0.5
+                  textFormat: Text.PlainText
                 }
               }
 
@@ -644,6 +653,7 @@ Panel {
 
                       Text {
                         text: coinRow.modelData.symbol
+                        textFormat: Text.PlainText
                         color: root.bar ? root.bar.foreground : Color.foreground
                         font.family: root.bar ? root.bar.fontFamily : Style.font.family
                         font.pixelSize: Style.font.body
@@ -652,6 +662,7 @@ Panel {
 
                       Text {
                         text: coinRow.modelData.name
+                        textFormat: Text.PlainText
                         color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                         font.family: root.bar ? root.bar.fontFamily : Style.font.family
                         font.pixelSize: Style.font.bodySmall
@@ -737,6 +748,7 @@ Panel {
 
                     Text {
                       text: pendingRow.modelData
+                      textFormat: Text.PlainText
                       color: root.bar ? root.bar.foreground : Color.foreground
                       font.family: root.bar ? root.bar.fontFamily : Style.font.family
                       font.pixelSize: Style.font.body
@@ -772,11 +784,23 @@ Panel {
             }
 
             PanelSeparator { foreground: root.bar ? root.bar.foreground : Color.foreground }
-
             // ---------------------------------------------------- add coin
             PanelSectionHeader {
               text: "ADD COIN"
               foreground: root.bar ? root.bar.foreground : Color.foreground
+            }
+
+            // The id list is capped at COINS_MAX (see Model.coinList), so
+            // past the limit every add is a no-op — say so instead of
+            // leaving a dead search result row.
+            Text {
+              visible: root.trackedCoins.length >= Model.COINS_MAX
+              width: parent.width
+              text: "Tracked-coin limit reached (" + Model.COINS_MAX + "). Remove a coin to add another."
+              color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.5)
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
             }
 
             TextField {
@@ -833,6 +857,7 @@ Panel {
                   Text {
                     Layout.fillWidth: true
                     text: resultRow.modelData.name + " (" + resultRow.modelData.symbol + ")"
+                    textFormat: Text.PlainText
                     color: root.bar ? root.bar.foreground : Color.foreground
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.bodySmall
