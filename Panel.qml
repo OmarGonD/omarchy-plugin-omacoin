@@ -743,6 +743,14 @@ Panel {
 
               delegate: Rectangle {
                 id: resultRow
+                required property var modelData
+                width: parent ? parent.width : 0
+                implicitHeight: Style.space(34)
+                radius: Style.cornerRadius
+                color: resultMouse.containsMouse
+                  ? Style.hoverFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                  : "transparent"
+
                 // Before the RowLayout, same z-order rule as coin rows.
                 MouseArea {
                   id: resultMouse
