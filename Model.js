@@ -45,6 +45,13 @@ function safeString(value, maxLen) {
   return s
 }
 
+// Shell-quoting guard for URLs passed into `bash -c 'curl ... <url> ...'`.
+// encodeURIComponent leaves single quotes literal; percent-encode them so a
+// quote character in user input can never terminate the quoted argument.
+function shellSafeUrl(url) {
+  return String(url).replace(/'/g, "%27")
+}
+
 function intervalLabel(minutes) {
   var m = Number(minutes)
   if (!isFinite(m) || m < 60) return m + (m === 1 ? " minute" : " minutes")
@@ -162,7 +169,8 @@ function parseMarkets(raw) {
   var data = parseJson(raw)
   if (!Array.isArray(data)) return null
   var map = {}
-  for (var i = 0; i < data.length && Object.keys(map).length < MARKETS_MAX_ROWS; i++) {
+  var count = 0
+  for (var i = 0; i < data.length && count < MARKETS_MAX_ROWS; i++) {
     var r = data[i]
     if (!r || !r.id) continue
     var id = safeString(r.id, COIN_ID_MAX_LEN)
@@ -177,10 +185,11 @@ function parseMarkets(raw) {
       change24h: num(num(r.price_change_percentage_24h_in_currency) !== null
         ? r.price_change_percentage_24h_in_currency : r.price_change_percentage_24h),
       change7d: num(r.price_change_percentage_7d_in_currency),
-      // Bounded copy of the remote array; sparkPoints() also ignores any
-      // non-finite entries at draw time.
+      // Bounded copy of the remote array; sparkPoints() draws every entry,
+      // so drop the nulls that num() produced for non-finite raw values.
       spark7d: (r.sparkline_in_7d && Array.isArray(r.sparkline_in_7d.price))
-        ? r.sparkline_in_7d.price.slice(0, SPARKLINE_MAX_POINTS).map(num) : []
+        ? r.sparkline_in_7d.price.slice(0, SPARKLINE_MAX_POINTS).map(num)
+          .filter(function(v) { return v !== null }) : []
     }
   }
   return map

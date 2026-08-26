@@ -330,12 +330,13 @@ BarWidget {
     // Producer-side byte cap: curl pipes through `head -c`, so no more
     // than RESPONSE_MAX_BYTES ever reaches the shell's memory. `pipefail`
     // keeps curl's own exit code (DNS/429/timeout diagnostics intact); an
-    // over-cap stream surfaces as a failed check. Single quotes are safe —
-    // encodeURIComponent escapes them and every literal segment is fixed.
+    // over-cap stream surfaces as a failed check. The URL is single-quoted
+    // for the shell: ids are already charset-filtered by COIN_ID_RE, and
+    // Model.shellSafeUrl %-encodes any remaining quote characters.
     marketsProc.command = ["bash", "-o", "pipefail", "-c",
-      "curl -fsS --compressed --max-time 15 '"
-      + "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
-      + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d"
+      "curl -fsS --compressed --max-time 15 '" + Model.shellSafeUrl(
+        "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
+        + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d")
       + "' | head -c " + Model.RESPONSE_MAX_BYTES]
     marketsProc.running = true
   }
@@ -369,6 +370,12 @@ BarWidget {
         root.fetchError = ""
         root.marketRows = Model.orderRows(map, root.trackedCoins)
         root.lastUpdated = new Date()
+      } else if (lastExitCode === 0 && stdoutText.length >= Model.RESPONSE_MAX_BYTES) {
+        // Exit 0 with a body at the cap: the document was truncated
+        // mid-stream (narrow pipe/timing window — over-cap streams
+        // normally die as SIGPIPE/141 instead). Not a config problem;
+        // let the retry ladder run.
+        root.fetchError = "response too large"
       } else if (lastExitCode === 0 && stdoutText.replace(/\s+/g, "") !== "") {
         root.fetchError = "CoinGecko returned no matching coins"
       } else {
@@ -510,6 +517,7 @@ BarWidget {
       Text {
         anchors.horizontalCenter: parent.horizontalCenter
         text: root.labelSymbol
+        textFormat: Text.PlainText
         color: Qt.darker(root.bar ? root.bar.barForeground : Color.foreground, 1.3)
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.bodySmall

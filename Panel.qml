@@ -168,12 +168,13 @@ Panel {
     chartError = ""
     // Same producer-side byte cap as the host's markets fetch (see
     // BarWidget.marketsFetch): pipefail keeps curl's diagnostics, head -c
-    // bounds what reaches memory. Single quotes are safe — the URL is
-    // fixed segments plus encodeURIComponent output.
+    // bounds what reaches memory. Model.shellSafeUrl %-encodes single
+    // quotes so the single-quoted shell argument cannot be terminated.
     chartProc.command = ["bash", "-o", "pipefail", "-c",
-      "curl -fsS --compressed --max-time 15 '"
-      + "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
-      + "/market_chart?vs_currency=usd&days=1' | head -c " + Model.RESPONSE_MAX_BYTES]
+      "curl -fsS --compressed --max-time 15 '" + Model.shellSafeUrl(
+        "https://api.coingecko.com/api/v3/coins/" + encodeURIComponent(primary)
+        + "/market_chart?vs_currency=usd&days=1")
+      + "' | head -c " + Model.RESPONSE_MAX_BYTES]
     chartProc.running = true
   }
 
@@ -185,8 +186,8 @@ Panel {
     if (searchProc.running) return
     searchProc.activeQuery = searchText
     searchProc.command = ["bash", "-o", "pipefail", "-c",
-      "curl -fsS --compressed --max-time 10 '"
-      + "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText)
+      "curl -fsS --compressed --max-time 10 '" + Model.shellSafeUrl(
+        "https://api.coingecko.com/api/v3/search?query=" + encodeURIComponent(searchText))
       + "' | head -c " + Model.RESPONSE_MAX_BYTES]
     searchProc.running = true
   }
