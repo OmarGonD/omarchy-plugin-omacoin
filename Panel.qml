@@ -144,7 +144,13 @@ Panel {
   // so a slow response for the previous primary can never render under
   // the new primary's name.
   function refreshCharts() {
-    if (!primary || chartProc.running) return
+    // Wait out a killed run's pending completion (exitSeen/streamSeen
+    // carry the OLD run's flags): proceeding over live state could pair
+    // a stale exit with the next run's stream and consume garbage.
+    if (!primary || chartProc.running || chartProc.exitSeen || chartProc.streamSeen) {
+      Qt.callLater(refreshCharts)
+      return
+    }
     root.chartGen++
     chartProc.gen = root.chartGen
     chartProc.activeId = primary
@@ -237,6 +243,7 @@ Panel {
       streamSeen = false
       if (gen !== root.chartGen || activeId !== root.primary) {
         stdoutText = ""
+        stderrText = ""
         return
       }
       var points = lastExitCode === 0 ? Model.parseMarketChart(stdoutText) : []
@@ -319,7 +326,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: addField.activeFocus
+      blocked: addField.activeFocus && addField.text !== ""
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onMoveRequested: function(dx, dy) {

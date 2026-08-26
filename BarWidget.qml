@@ -272,7 +272,7 @@ BarWidget {
   // instance, deduped by Timer.restart() semantics.
   Timer {
     id: gateCatchup
-    onTriggered: root.marketsFetch()
+    onTriggered: root.refresh()
   }
 
   // Every path that wants fresh data lands here (poll tick, manual
@@ -289,10 +289,11 @@ BarWidget {
     }
     if (marketsProc.running) {
       // A fetch is already in flight (e.g. refresh raced the poll tick).
-      // Queue one re-run with the latest command rather than restarting
-      // the process per call — repeated running=true would multiply API
-      // calls.
-      root.fetchQueued = true
+      // Queue one re-run — but only when the coin list actually changed:
+      // a broadcast refresh hitting the leader N times must not become N
+      // CoinGecko calls once the gate opens.
+      var want = root.trackedCoins.join(",")
+      if (want !== marketsProc.requestedIds) root.fetchQueued = true
       return
     }
     var ids = root.trackedCoins.join(",")
@@ -300,6 +301,7 @@ BarWidget {
       root.fetchQueued = false
       return
     }
+    marketsProc.requestedIds = ids
     marketsProc.command = ["curl", "-fsS", "--max-time", "15",
       "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=" + encodeURIComponent(ids)
       + "&order=market_cap_desc&sparkline=true&price_change_percentage=1h,24h,7d"]
@@ -313,6 +315,7 @@ BarWidget {
   // result is processed once both the stream and the exit are in.
   Process {
     id: marketsProc
+    property string requestedIds: ""
     property string stdoutText: ""
     property string stderrText: ""
     property int lastExitCode: 0
