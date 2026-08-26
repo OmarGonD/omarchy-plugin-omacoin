@@ -1,5 +1,7 @@
 # OmaCoin
 
+![OmaCoin panel](preview.png)
+
 An [Omarchy](https://omarchy.org/) shell plugin that tracks crypto prices via
 the [CoinGecko](https://www.coingecko.com/) public API.
 
@@ -50,19 +52,43 @@ All of it is editable from the popup, so you never have to touch the file.
 ## Install
 
 ```bash
-omarchy plugin add https://git.packden.us/crueber/omarchy-plugin-omacoin.git --enable --yes
+omarchy plugin add https://github.com/crueber/omarchy-plugin-omacoin.git --enable --yes
 ```
 
 or by hand:
 
 ```bash
-git clone https://git.packden.us/crueber/omarchy-plugin-omacoin.git \
+git clone https://github.com/crueber/omarchy-plugin-omacoin.git \
   ~/.config/omarchy/plugins/crueber.omacoin
 omarchy-shell shell rescanPlugins
 omarchy plugin enable crueber.omacoin
 ```
 
-Requires `curl` (used for all CoinGecko requests).
+Requires `curl` (used for all CoinGecko requests). No API key: everything
+runs on CoinGecko's public endpoints, rate-limited to one call per minute
+(enforced by the plugin itself).
+
+## Uninstall
+
+```bash
+omarchy plugin disable crueber.omacoin
+omarchy plugin remove crueber.omacoin
+```
+
+or by hand: remove the widget from your bar layout in
+`~/.config/omarchy/shell.json`, delete
+`~/.config/omarchy/plugins/crueber.omacoin`, and restart the shell
+(`omarchy restart shell`). All plugin state lives inline on the widget's
+entry in `~/.config/omarchy/shell.json` — removing the entry removes every
+trace; no other files are written.
+
+## Dependencies
+
+- `curl` — every CoinGecko request (markets, search, market chart). Standard
+  on Omarchy installs.
+- Network access to `api.coingecko.com` (public API, no key).
+
+Mirrored on [Forgejo](https://git.packden.us/crueber/omarchy-plugin-omacoin).
 
 ## License
 
