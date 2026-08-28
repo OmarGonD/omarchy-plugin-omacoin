@@ -7,11 +7,12 @@ import "Model.js" as Model
 // OmaCoin bar widget: the primary coin's USD price and a direction glyph.
 //
 // Left click opens the panel (coins tab: tracked list, trends, add/remove;
-// settings tab: check frequency and flat-band sliders), middle click cycles
-// the primary through the tracked coins, right click forces a refresh. All
-// user state lives inline on this widget's shell.json entry (coins /
-// primary / intervalMin / flatThresholdPct), written through
-// bar.shell.updateEntryInline so every bar instance stays in sync.
+// settings tab: bar position, check frequency, and flat-band sliders),
+// middle click cycles the primary through the tracked coins, right click
+// forces a refresh. Coin state lives inline on this widget's shell.json
+// entry (coins / primary / intervalMin / flatThresholdPct), written
+// through bar.shell.updateEntryInline. Bar section is host layout
+// (left/center/right), moved via pluginRegistry.moveBarWidget.
 //
 // Polling: a bar surface exists per monitor, so several instances of this
 // widget can be alive at once. Exactly one — the "leader", elected through
@@ -46,6 +47,9 @@ BarWidget {
   property string primary: "bitcoin"
   property int intervalMin: 60
   property real flatThresholdPct: Model.FLAT_DEFAULT
+  // Which bar.layout section this entry currently occupies. Not an
+  // inline setting — the host stores it as which array the entry is in.
+  property string barSection: ""
 
   // True while this instance owns the module's single poll loop.
   property bool pollLeader: false
@@ -65,7 +69,34 @@ BarWidget {
     if (prim !== primary) primary = prim
     if (iv !== intervalMin) intervalMin = iv
     if (flat !== flatThresholdPct) flatThresholdPct = flat
+    refreshBarSection()
   }
+
+  function currentBarSection() {
+    var layout = root.bar && root.bar.barConfig ? root.bar.barConfig.layout : null
+    return Model.barSectionOf(layout, root.moduleName)
+  }
+
+  function refreshBarSection() {
+    var next = currentBarSection()
+    if (next !== barSection) barSection = next
+  }
+
+  // Relocate this widget between bar.layout left/center/right. The host
+  // rewrite destroys the live widget, so the panel is closed first and
+  // the move is deferred one tick.
+  function setBarSection(section) {
+    var next = Model.clampSection(section)
+    if (next === "") return
+    if (next === currentBarSection()) return
+    var registry = root.bar && root.bar.shell && root.bar.shell.pluginRegistry
+    if (!registry || typeof registry.moveBarWidget !== "function") return
+    root.close()
+    Qt.callLater(function() {
+      registry.moveBarWidget(root.moduleName, { section: next })
+    })
+  }
+
   // Suppress the tracked-coins refetch during startup: the poll timer's
   // triggeredOnStart already fetches, so a changed list would only queue
   // a redundant second call.
@@ -461,6 +492,7 @@ BarWidget {
     function setPrimary(id: string): void { root.updateSetting("primary", Model.primaryId(root.trackedCoins, id)) }
     function setIntervalMin(minutes: int): void { root.updateSetting("intervalMin", Model.clampInterval(minutes)) }
     function setFlatThreshold(pct: real): void { root.updateSetting("flatThresholdPct", Model.clampFlat(pct)) }
+    function setBarSection(section: string): void { root.setBarSection(section) }
   }
 
   Row {
