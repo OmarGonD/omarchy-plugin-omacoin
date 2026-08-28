@@ -82,6 +82,21 @@ BarWidget {
     if (next !== barSection) barSection = next
   }
 
+  // Take the last published markets. Needed after a layout move: the
+  // host destroys this widget and builds a new one that wins leadership
+  // immediately, so the follower consume path never runs, and the
+  // rate-limit gate would otherwise leave the bar blank for up to 60s.
+  function hydrateFromPoll() {
+    var shared = Model.pollSnapshot()
+    if (!shared || shared.seq <= root.consumedSeq) return false
+    root.consumedSeq = shared.seq
+    root.marketRows = shared.rows
+    root.lastUpdated = shared.updated ? new Date(shared.updated) : new Date(0)
+    root.fetchError = shared.error || ""
+    root.initialFetch = false
+    return true
+  }
+
   // Relocate this widget between bar.layout left/center/right. The host
   // rewrite destroys the live widget, so the panel is closed first and
   // the move is deferred one tick.
@@ -103,6 +118,7 @@ BarWidget {
   property bool startupDone: false
   Component.onCompleted: {
     applySettings()
+    hydrateFromPoll()
     startupDone = true
   }
   Component.onDestruction: Model.pollRelease(root)
@@ -277,11 +293,12 @@ BarWidget {
   // ---- poll coordination ---------------------------------------------
   //
   // Leadership heartbeat + result fan-out. The leader claims once and then
-  // only re-beats; everyone else consumes published state whenever the
-  // publish sequence moved (successes AND failures — a failed check keeps
-  // the old timestamp, so comparing timestamps would hide errors from
-  // secondary monitors). A dead leader (widget destroyed with the monitor
-  // it lived on) stops beating and is replaced within the 20s window.
+  // only re-beats; everyone hydrates from the last publish whenever seq
+  // moved (successes AND failures — a failed check keeps the old
+  // timestamp, so comparing timestamps would hide errors from secondary
+  // monitors). A dead leader (widget destroyed with the monitor it lived
+  // on, or rebuilt by a bar-section move) is replaced within the 20s
+  // window; the new instance hydrates so the bar keeps last prices.
   property int consumedSeq: 0
   Timer {
     id: pollCoordination
@@ -290,17 +307,12 @@ BarWidget {
     running: true
     triggeredOnStart: true
     onTriggered: {
-      var wasLeader = root.pollLeader
       root.pollLeader = Model.pollClaim(root, Date.now())
-      if (root.pollLeader || wasLeader) return
-      var shared = Model.pollConsume(root)
-      if (shared && shared.seq > root.consumedSeq) {
-        root.consumedSeq = shared.seq
-        root.marketRows = shared.rows
-        root.lastUpdated = new Date(shared.updated)
-        root.fetchError = shared.error
-        root.initialFetch = false
-      }
+      // Leaders used to skip consume because they were the publisher. A
+      // freshly-elected leader after a widget recreate has empty rows and
+      // must still take the last publish. hydrateFromPoll is a no-op when
+      // seq has not moved, so a live leader does not clobber itself.
+      hydrateFromPoll()
     }
   }
 

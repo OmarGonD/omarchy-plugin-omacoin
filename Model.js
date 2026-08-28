@@ -435,6 +435,15 @@ function pollPublish(widget, rows, updatedMs, error, ok) {
 
 function pollConsume(widget) {
   if (pollState.leader === widget) return null
+  return pollSnapshot()
+}
+
+// Last published markets, regardless of who the leader is. A widget
+// rebuilt by a bar-layout move becomes the new leader with empty
+// marketRows; it must still be able to take the previous publish so
+// the bar does not go blank while the rate-limit gate defers a fetch.
+function pollSnapshot() {
+  if (pollState.seq === 0) return null
   return { rows: pollState.rows, updated: pollState.updated, error: pollState.error, seq: pollState.seq }
 }
 
